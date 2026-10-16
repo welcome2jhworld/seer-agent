@@ -1,0 +1,87 @@
+{
+  "schema_version": 1,
+  "id": "oil_leak",
+  "version": 1,
+  "purpose": "Observe persistent surface change, recall maintenance context and request suspected oil-leak review.",
+  "sources": {
+    "camera": [
+      "camera.frame"
+    ],
+    "site-sop": [
+      "document"
+    ],
+    "operator": [
+      "message"
+    ],
+    "machine-sensor": [
+      "sensor"
+    ]
+  },
+  "observe": [
+    {
+      "source": "camera",
+      "kind": "camera.frame",
+      "tool": "fixture.compare",
+      "emits": "vision.change",
+      "arguments": {}
+    }
+  ],
+  "remember": {
+    "sources": [
+      "camera",
+      "site-sop",
+      "operator",
+      "machine-sensor"
+    ],
+    "max_items": 50,
+    "max_age_ms": 86400000
+  },
+  "condition": {
+    "type": "oil_leak",
+    "config": {
+      "source": "camera",
+      "kind": "vision.change",
+      "area": "pump",
+      "hold_ms": 2000,
+      "clear_ms": 1000,
+      "max_gap_ms": 1500,
+      "document_source": "site-sop",
+      "operator_source": "operator",
+      "sensor_source": "machine-sensor"
+    }
+  },
+  "act": [
+    {
+      "on": "opened",
+      "tool": "record",
+      "arguments": {
+        "text": "$summary"
+      }
+    },
+    {
+      "on": "review",
+      "tool": "record",
+      "arguments": {
+        "text": "$summary"
+      }
+    },
+    {
+      "on": "cleared",
+      "tool": "record",
+      "arguments": {
+        "text": "$summary"
+      }
+    }
+  ],
+  "policy": {
+    "allowed_tools": [
+      "fixture.compare",
+      "record"
+    ],
+    "allow_external": false,
+    "max_pending": 64,
+    "max_concurrency": 4,
+    "timeout_ms": 30000,
+    "max_event_age_ms": 60000
+  }
+}

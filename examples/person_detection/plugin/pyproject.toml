@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "seer-site-example"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["seer-agent>=0.2.0a1"]
+
+[project.entry-points."seer_agent.plugins"]
+site = "site_tools:register"
+
+[tool.setuptools]
+py-modules = ["site_tools"]

@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "id": "person_detection",
+  "version": 1,
+  "purpose": "Observe person presence in a restricted region and retain context for review.",
+  "sources": {
+    "camera": [
+      "camera.frame"
+    ],
+    "site-sop": [
+      "document"
+    ],
+    "operator": [
+      "message"
+    ]
+  },
+  "observe": [
+    {
+      "source": "camera",
+      "kind": "camera.frame",
+      "tool": "fixture.detect",
+      "emits": "vision.detections",
+      "arguments": {}
+    }
+  ],
+  "remember": {
+    "sources": [
+      "camera",
+      "site-sop",
+      "operator"
+    ],
+    "max_items": 50,
+    "max_age_ms": 86400000
+  },
+  "condition": {
+    "type": "person_presence",
+    "config": {
+      "source": "camera",
+      "kind": "vision.detections",
+      "area": "gate",
+      "hold_ms": 2000,
+      "clear_ms": 1000,
+      "max_gap_ms": 1500,
+      "document_source": "site-sop",
+      "operator_source": "operator",
+      "region": [
+        0,
+        0,
+        1,
+        1
+      ]
+    }
+  },
+  "act": [
+    {
+      "on": "opened",
+      "tool": "record",
+      "arguments": {
+        "text": "$summary"
+      }
+    },
+    {
+      "on": "review",
+      "tool": "record",
+      "arguments": {
+        "text": "$summary"
+      }
+    },
+    {
+      "on": "cleared",
+      "tool": "record",
+      "arguments": {
+        "text": "$summary"
+      }
+    }
+  ],
+  "policy": {
+    "allowed_tools": [
+      "fixture.detect",
+      "record"
+    ],
+    "allow_external": false,
+    "max_pending": 64,
+    "max_concurrency": 4,
+    "timeout_ms": 30000,
+    "max_event_age_ms": 60000
+  }
+}
