@@ -40,21 +40,25 @@ Pending capacity is checked inside the ingestion transaction. Backpressure rolls
 
 ## Host protocol v1
 
-`seer-agent serve --db PATH` holds many missions with one registry and one store. The host app writes JSON Lines to stdin and reads JSON Lines from stdout; logs never go to stdout and there is no network port. Every message has `v` (1), `type`, `id` and `body`. Replies carry `reply_to` with the request `id`. A message is at most 256 KiB.
+`seer-agent serve --db PATH` holds many missions with one registry and one store, and takes an exclusive lock on the store; a second `serve` on the same store exits with `store_in_use`. The host app writes UTF-8 JSON Lines to stdin and reads ASCII JSON Lines from stdout; logs never go to stdout and there is no network port. Every message has `v` (1), `type`, `id` and `body`. Replies carry `reply_to` with the request `id`. A message is at most 256 KiB. A line that is not UTF-8, not JSON or not a valid request gets an `error` with a code and the session continues.
 
 | From the host | Body | Reply |
 |---|---|---|
 | `hello` | `protocol`, `app_version`, `clock_source`, `tools` (host tool specs) | `ready` with `harness_version` and the missions in the store |
-| `mission.open` | `mission` (versioned document) | `ack` with the mission state |
+| `mission.open` | `mission` (versioned document), optional `after_revision` | `ack` with the mission state and latest decision `revision`, then every decision after `after_revision` |
 | `mission.close` | `mission` (identity and version) | `ack` |
 | `event` | `event` (Event envelope) | `ack` with a result per mission that lists the source |
 | `coverage` | `source`, `from_ms`, `to_ms`, `observed`, `reason` | `ack`; missions that list `coverage` for the source receive a `coverage` event, unknown when not observed |
-| `tool.result` | `call`, `status`, `data`, `receipt` | none |
-| `incident.clear` | `mission`, optional `event_id` | `ack` with the cancelled pending operations |
+| `tool.result` | `call`, `status`, `data`, `receipt` | `error` only: `unknown_call`, `call_expired`, or a contract code for a result that does not match the tool (recorded as unknown) |
+| `incident.clear` | `mission`, optional `event_id` | `ack` with the cancelled pending actions; an active incident records a `cleared` decision |
 | `shutdown` | optional `timeout_ms` | `ack` after pending work drains or the timeout passes |
 
-The harness sends `heartbeat` every 2 s with pending work per mission, `tool.call` (`call`, `tool`, `mission`, `arguments`, `event`, `deadline_ms`) for host tools, `decision` for each condition transition and `error` with a `code`. Error messages never echo input.
+After `ready`, the harness sends `heartbeat` every 2 s with pending work and health per mission, `tool.call` (`call`, `tool`, `mission`, `arguments`, `event`, `deadline_ms`) for host tools, `decision` (with its `revision`) for each condition transition and `error` with a `code`. Error messages never echo input.
 
-Host tools declared at `hello` are proxies in the registry and are pinned in mission fingerprints like any other tool. The runtime's deadline applies to them: a call without a `tool.result` before the deadline becomes an unknown outcome, and a late result is refused. A harness restart reopens missions from the store when the host sends `mission.open` again. Calls interrupted by the restart stay unknown and are never sent again.
+Host tools declared at `hello` are proxies in the registry and are pinned in mission fingerprints like any other tool. A `hello` with any invalid or duplicate tool registers none of them. The runtime's deadline applies to host tools: a call without a valid `tool.result` before the deadline becomes an unknown outcome, and a late result is refused. A tool call that would exceed the message limit fails without being sent. Tools run outside the dispatch lock, so a slow host tool does not hold back other work of the mission up to `max_concurrency`. Heartbeats also drain each mission, so deadlines expire without new events.
+
+The host decides which missions run: after a restart it sends `mission.open` again, with `after_revision` set to the last decision it applied so none is lost. Work the previous process left running is marked unknown with reason `harness_restarted` and is never sent again.
+
+`incident.clear` cancels pending actions only; observation work continues. It sets the mission state's `active` to false, which the bundled conditions use for an open incident.
 
 The native Seer App still runs its previous C++ runtime. Connecting it to `serve` is the bridge phase of the runtime convergence plan; it must preserve approval gates, source identities, state and outbox semantics before execution moves.

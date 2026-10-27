@@ -138,6 +138,18 @@ class Store:
                             (operation, status, now, encoded({"data": data, "receipt": receipt})))
             return True
 
+    def interrupt(self, key: str, now: int) -> list[str]:
+        """Running work left by a previous process has an unknown outcome; it is never resent.
+        Only the process that owns the store exclusively may call this."""
+        with self.transaction():
+            rows = [row[0] for row in self.db.execute(
+                "SELECT id FROM operations WHERE mission=? AND status='running'", (key,)).fetchall()]
+            data = encoded({"reason": "harness_restarted"})
+            for operation in rows:
+                self.db.execute("UPDATE operations SET status='unknown',result=?,completed=? WHERE id=?", (data, now, operation))
+                self.db.execute("INSERT INTO operation_history VALUES(NULL,?,?,?,?)", (operation, "unknown", now, data))
+            return rows
+
     def expire(self, key: str, now: int):
         with self.transaction():
             rows = self.db.execute("SELECT id,status FROM operations WHERE mission=? AND status IN ('pending','running') AND deadline<=?",

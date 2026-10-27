@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 import sys
 
 from .builtins import builtin_registry, demo_registry
 from .contracts import ContractError, Mission, encoded
-from .host import Host, serve
+from .host import Host, PROTOCOL, serve, writer
 from .runtime import Runtime, wall_time_ms
 from .sources import jsonl
 from .store import Store
@@ -89,20 +90,47 @@ async def run(args):
         store.close()
 
 
-async def host(args):
+def exclusive(path: Path):
+    """One serve process owns a store, so it may mark work left running by a crash as unknown."""
+    handle = open(path.with_name(path.name+".lock"), "a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        raise ContractError("store_in_use") from None
+    return handle
+
+
+async def host(args, write):
     registry = builtin_registry()
     for name in args.plugin:
         registry.load_plugin(name)
     args.db.parent.mkdir(parents=True, exist_ok=True)
+    lock = exclusive(args.db)
     store = Store(args.db)
     try:
-        return await serve(Host(registry, store, output, allow_external=args.allow_external), sys.stdin)
+        return await serve(Host(registry, store, write, allow_external=args.allow_external), sys.stdin.buffer)
     finally:
         store.close()
+        lock.close()
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
+    if args.command == "serve":
+        write = writer(sys.stdout.buffer)
+        try:
+            return asyncio.run(host(args, write))
+        except (ContractError, ValueError, OSError) as error:
+            # stdout carries only protocol messages; never print arbitrary details.
+            write({"v": PROTOCOL, "type": "error", "id": "h0", "body": {
+                "code": str(error) if isinstance(error, ContractError) else "invalid_input_or_storage"}})
+            return 2
     try:
         if args.command == "tools":
             registry = demo_registry() if args.demo else builtin_registry()
@@ -114,8 +142,6 @@ def main(argv=None):
             return 0
         if args.command == "run":
             return asyncio.run(run(args))
-        if args.command == "serve":
-            return asyncio.run(host(args))
         if not args.db.is_file() or not 1 <= args.limit <= 1000:
             raise ContractError("invalid_database_or_limit")
         store = Store(args.db)

@@ -204,7 +204,9 @@ class Runtime:
                                   (row["id"], row["outcome_revision"], row["status"]))
 
     async def drain(self):
-        """Dispatch a bounded batch; ingestion can continue while asynchronous tools wait."""
+        """Dispatch a bounded batch; ingestion can continue while asynchronous tools wait.
+        Tools run outside the dispatch lock, so a concurrent drain can claim other pending work
+        up to max_concurrency while one slow tool is still running."""
         async with self._dispatch_lock:
             self._check_definition()
             self.store.expire(self.key, self.clock())
@@ -212,13 +214,35 @@ class Runtime:
             rows = self.store.db.execute("""SELECT * FROM operations WHERE mission=? AND status='pending'
                 ORDER BY event_revision,id LIMIT ?""",
                 (self.key, self.doc["policy"]["max_concurrency"])).fetchall()
-            claimed = await asyncio.gather(*(self._execute(dict(row)) for row in rows))
+        claimed = await asyncio.gather(*(self._execute(dict(row)) for row in rows))
+        async with self._dispatch_lock:
             self._apply_observations()
-            return sum(claimed)
+        return sum(claimed)
 
     async def flush(self):
         while await self.drain():
             pass
+
+    def clear(self, event_id: str | None = None) -> list[str]:
+        """Operator clear: cancel pending actions and record a cleared decision when active."""
+        self._check_definition()
+        now = self.clock()
+        with self.store.transaction():
+            query, arguments = "SELECT id FROM operations WHERE mission=? AND role='act' AND status='pending'", [self.key]
+            if event_id is not None:
+                query, arguments = query+" AND event_id=?", arguments+[event_id]
+            cancelled = [row[0] for row in self.store.db.execute(query, arguments).fetchall()]
+            for operation in cancelled:
+                self.store.db.execute("UPDATE operations SET status='cancelled',completed=? WHERE id=?", (now, operation))
+                self.store.db.execute("INSERT INTO operation_history VALUES(NULL,?,?,?,?)", (operation, "cancelled", now, "{}"))
+            state = self.store.state(self.key)
+            if state.get("active"):
+                state = {**state, "active": False}
+                self.store.db.execute("UPDATE missions SET state=? WHERE id=?", (encoded(state), self.key))
+                self.store.db.execute("INSERT INTO decisions VALUES(NULL,?,?,?,?,?,?)", (
+                    self.key, event_id or f"operator.clear:{now}", "cleared",
+                    "Cleared by the operator. Incident history is retained.", "[]", encoded(state)))
+        return cancelled
 
     def cancel(self, operation_id: str):
         with self.store.transaction():
