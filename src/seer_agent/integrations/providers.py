@@ -73,20 +73,33 @@ def twilio(*, name: str, mode: str, sender: str, recipient: str,
          "content_sid": content_sid, "account_env": account_env, "credential_env": token_env}), execute)
 
 
-def webhook(*, name: str, endpoint: str, transport=None, token_env: str | None = None) -> Tool:
-    transport = transport or HttpTransport()
+def webhook(*, name: str, endpoint: str, transport=None, token_env: str | None = None,
+            allow_private: bool = False, require_receipt: bool = True) -> Tool:
+    """require_receipt=False accepts any 2xx answer, for LAN systems that return no body; the
+    receipt then records the HTTP status and operation identity."""
+    transport = transport or HttpTransport(allow_private=allow_private)
     async def execute(context, arguments):
         headers = {"Content-Type": "application/json", "Idempotency-Key": context.operation_id}
         if token_env:
             headers["Authorization"] = "Bearer "+secret(token_env)
+        options = {} if require_receipt else {"json_response": False}
         result = await transport.post(endpoint, headers,
-            json_bytes({"operation_id": context.operation_id, "mission_id": context.mission_id, **arguments}), timeout=10)
+            json_bytes({"operation_id": context.operation_id, "mission_id": context.mission_id, **arguments}),
+            timeout=10, **options)
         receipt = result.data.get("receipt")
         if 200 <= result.status < 300 and isinstance(receipt, str) and receipt:
             return ToolResult("accepted", {"provider": "webhook", "state": "accepted"}, receipt)
+        if 200 <= result.status < 300 and not require_receipt:
+            return ToolResult("accepted", {"provider": "webhook", "state": "accepted"},
+                              f"http-{result.status}:{context.operation_id}")
         return ToolResult("unknown", {"reason": "provider_did_not_confirm_acceptance"})
-    return Tool(ToolSpec(name, "1", "external", TEXT_INPUT, ACCEPTED,
-                         {"endpoint": endpoint, "credential_env": token_env}), execute)
+    configuration = {"endpoint": endpoint, "credential_env": token_env}
+    # Defaults stay out of the descriptor so existing mission fingerprints keep matching.
+    if allow_private:
+        configuration["allow_private"] = True
+    if not require_receipt:
+        configuration["require_receipt"] = False
+    return Tool(ToolSpec(name, "1", "external", TEXT_INPUT, ACCEPTED, configuration), execute)
 
 
 def model_endpoint(*, name: str, endpoint: str, output_schema: dict,

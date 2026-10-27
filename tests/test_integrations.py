@@ -87,3 +87,49 @@ def test_http_errors_do_not_look_like_success(monkeypatch):
     monkeypatch.setenv("TEST_TOKEN", "123:token")
     tool = telegram(name="telegram", chat_id="room", token_env="TEST_TOKEN", transport=Transport(Response(500, {})))
     assert execute(tool).status == "unknown"
+
+
+def test_plain_http_is_only_for_literal_private_addresses():
+    from seer_agent import ContractError
+    from seer_agent.integrations.http import HttpTransport
+    lan = HttpTransport(allow_private=True)
+    for url in ["http://192.168.0.10/alert", "http://10.1.2.3:8080/hook", "http://127.0.0.1/x", "http://[fe80::1]/x",
+                "https://example.invalid/hook"]:
+        lan.check(url)
+    for url in ["http://plc.factory.lan/alert", "http://8.8.8.8/hook", "ftp://192.168.0.10/x", "http://user:pw@10.0.0.1/x"]:
+        with pytest.raises(ContractError):
+            lan.check(url)
+    with pytest.raises(ContractError):
+        HttpTransport().check("http://192.168.0.10/alert")
+
+
+def test_existing_webhook_descriptor_is_unchanged():
+    tool = webhook(name="notify", endpoint="https://example.invalid/hook")
+    assert tool.spec.configuration == {"endpoint": "https://example.invalid/hook", "credential_env": None}
+
+
+def test_lan_webhook_without_receipt_is_accepted_on_any_2xx():
+    import http.server
+    import threading
+    received = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(204)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        endpoint = f"http://127.0.0.1:{server.server_port}/alert"
+        result = execute(webhook(name="plc", endpoint=endpoint, allow_private=True, require_receipt=False))
+        assert result.status == "accepted" and result.receipt == "http-204:operation-1"
+        assert received == [{"operation_id": "operation-1", "mission_id": "mission:1", "text": "Suspected leak <check>"}]
+        strict = execute(webhook(name="strict", endpoint=endpoint, allow_private=True))
+        assert strict.status == "unknown"
+    finally:
+        server.shutdown()

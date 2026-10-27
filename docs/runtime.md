@@ -44,7 +44,7 @@ Pending capacity is checked inside the ingestion transaction. Backpressure rolls
 
 | From the host | Body | Reply |
 |---|---|---|
-| `hello` | `protocol`, `app_version`, `clock_source`, `tools` (host tool specs) | `ready` with `harness_version` and the missions in the store |
+| `hello` | `protocol`, `app_version`, `clock_source`, `tools` (host tool specs), `integrations` (harness-run senders) | `ready` with `harness_version` and the missions in the store |
 | `mission.open` | `mission` (versioned document), optional `after_revision` | `ack` with the mission state and latest decision `revision`, then every decision after `after_revision` |
 | `mission.close` | `mission` (identity and version) | `ack` |
 | `event` | `event` (Event envelope) | `ack` with a result per mission that lists the source |
@@ -56,6 +56,8 @@ Pending capacity is checked inside the ingestion transaction. Backpressure rolls
 After `ready`, the harness sends `heartbeat` every 2 s with pending work and health per mission, `tool.call` (`call`, `tool`, `mission`, `arguments`, `event`, `deadline_ms`) for host tools, `decision` (with its `revision`) for each condition transition and `error` with a `code`. Error messages never echo input.
 
 Host tools declared at `hello` are proxies in the registry and are pinned in mission fingerprints like any other tool. A `hello` with any invalid or duplicate tool registers none of them. The runtime's deadline applies to host tools: a call without a valid `tool.result` before the deadline becomes an unknown outcome, and a late result is refused. A tool call that would exceed the message limit fails without being sent. Tools run outside the dispatch lock, so a slow host tool does not hold back other work of the mission up to `max_concurrency`. Heartbeats also drain each mission, so deadlines expire without new events.
+
+An integration is `{"kind": "webhook", "name", "endpoint", "allow_private", "require_receipt"}`. The harness sends it itself, so a webhook to a LAN system works without internet. Plain HTTP is accepted only for literal private, loopback or link-local addresses with `allow_private`; host names need HTTPS. With `require_receipt` false, any 2xx answer is accepted and the receipt records the status and operation identity. Webhooks are external effects and need `--allow-external` and mission policy.
 
 The host decides which missions run: after a restart it sends `mission.open` again, with `after_revision` set to the last decision it applied so none is lost. Work the previous process left running is marked unknown with reason `harness_restarted` and is never sent again.
 

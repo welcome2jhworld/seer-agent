@@ -280,3 +280,48 @@ def test_killed_harness_never_resends_its_interrupted_call(tmp_path):
     row = [r for r in store.operations("person_detection:1") if r["id"] == call][0]
     assert (row["status"], json.loads(row["result"])["reason"]) == ("unknown", "harness_restarted")
     store.close()
+
+
+def test_hello_registers_a_lan_webhook_the_mission_can_use(tmp_path):
+    import http.server
+    import threading
+    received = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    async def scenario():
+        h = Harness(tmp_path)
+        h.host.allow_external = True
+        hook = {"kind": "webhook", "name": "site.webhook", "endpoint": f"http://127.0.0.1:{server.server_port}/alert",
+                "allow_private": True, "require_receipt": False}
+        await h.send("hello", {"protocol": 1, "integrations": [{**hook, "endpoint": "http://plc.lan/alert"}]}, "bad")
+        assert h.reply("bad")[0]["body"]["code"] == "https_required"
+        await h.send("hello", {"protocol": 1, "tools": [NOTIFY], "integrations": [hook]}, "hello")
+        doc = mission()
+        doc["act"] = [{"on": "opened", "tool": "site.webhook", "arguments": {"text": "$summary"}}]
+        doc["policy"]["allowed_tools"] = ["fixture.detect", "site.webhook"]
+        doc["policy"]["allow_external"] = True
+        await h.send("mission.open", {"mission": doc}, "open")
+        await h.feed()
+        for _ in range(100):
+            if received:
+                break
+            await asyncio.sleep(0.02)
+        await h.settle()
+        assert [r["status"] for r in h.operations("site.webhook")] == ["accepted"]
+        assert received[0]["text"] == "Person presence detected in the monitored region."
+        await h.host.close()
+    try:
+        asyncio.run(scenario())
+    finally:
+        server.shutdown()

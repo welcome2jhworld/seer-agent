@@ -8,6 +8,8 @@ import threading
 from typing import Callable, Iterable
 
 from .contracts import ContractError, Event, Mission
+from .integrations import webhook
+from .integrations.http import HttpTransport
 from .runtime import Runtime, wall_time_ms
 from .store import Store
 from .tools import Registry, Tool, ToolContext, ToolResult, ToolSpec
@@ -132,6 +134,11 @@ class Host:
             raise
         except Exception:
             raise ContractError("invalid_host_tools") from None
+        integrations = body.get("integrations", [])
+        if not isinstance(integrations, list) or len(integrations) > 16:
+            raise ContractError("invalid_integrations")
+        for item in integrations:
+            proxies.append(self.integration(item))
         names = [tool.spec.name for tool in proxies]
         if len(set(names)) != len(names) or any(name in self.registry.tools for name in names):
             raise ContractError("duplicate_tool")
@@ -140,6 +147,19 @@ class Host:
         self.greeted = True
         stored = [row[0] for row in self.store.db.execute("SELECT id FROM missions ORDER BY id")]
         self.send("ready", {"protocol": PROTOCOL, "harness_version": harness_version(), "missions": stored}, reply)
+
+    @staticmethod
+    def integration(item) -> Tool:
+        """Host-configured senders that run in the harness, such as a LAN webhook."""
+        if not isinstance(item, dict) or item.get("kind") != "webhook":
+            raise ContractError("invalid_integrations")
+        allow_private, require_receipt = item.get("allow_private", False), item.get("require_receipt", True)
+        if not isinstance(allow_private, bool) or not isinstance(require_receipt, bool):
+            raise ContractError("invalid_integrations")
+        endpoint = text(item.get("endpoint"), limit=2048)
+        HttpTransport(allow_private=allow_private).check(endpoint)
+        return webhook(name=text(item.get("name")), endpoint=endpoint, allow_private=allow_private,
+                       require_receipt=require_receipt)
 
     async def open(self, body: dict, reply) -> None:
         if not isinstance(body.get("mission"), dict):
