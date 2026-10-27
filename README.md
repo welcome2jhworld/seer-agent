@@ -45,6 +45,8 @@ State changes and tool intents commit together before execution. SQLite stores h
 - [Person detection](examples/person_detection/README.md): camera observations, a site document and operator chat inform region-presence monitoring.
 - [Suspected oil leak](examples/oil_leak/README.md): persistent visible change, maintenance context and an oil-level sensor inform a review request.
 
+The `object_dwell` condition alerts once per tracked object that stays in a polygon zone: the bottom center of its box must be inside, it keeps its appearance through up to 10 s hidden, and a camera reconnect restarts its dwell. Its replay fixtures are in `tests/test_dwell.py`.
+
 Both examples run through the same runtime and tool contract. They demonstrate workflow execution with synthetic evidence, not detection accuracy. Their README files describe how changing relevant context changes the result and how to inspect original receipts after restart.
 
 ## Extend
