@@ -23,6 +23,8 @@ seer-agent tools --demo
 
 On Windows, activate `.venv\Scripts\Activate.ps1` in PowerShell. The examples make no network requests and need no models or credentials.
 
+A host app runs many missions in one process with `seer-agent serve --db PATH`. It speaks host protocol v1 as JSON Lines on stdin and stdout; see [docs/runtime.md](docs/runtime.md#host-protocol-v1).
+
 ## Observe, remember, act
 
 | Mission component | Responsibility |

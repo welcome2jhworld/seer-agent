@@ -8,6 +8,7 @@ import sys
 
 from .builtins import builtin_registry, demo_registry
 from .contracts import ContractError, Mission, encoded
+from .host import Host, serve
 from .runtime import Runtime, wall_time_ms
 from .sources import jsonl
 from .store import Store
@@ -28,6 +29,10 @@ def parser():
     run.add_argument("--demo", action="store_true", help="Register synthetic fixture model tools")
     run.add_argument("--allow-external", action="store_true", help="Permit mission-authorized external actions")
     run.add_argument("--plugin", action="append", default=[], help="Explicit installed seer_agent.plugins entry point")
+    host = commands.add_parser("serve", help="Run missions for a host app over stdio JSON Lines (host protocol v1)")
+    host.add_argument("--db", required=True, type=Path)
+    host.add_argument("--allow-external", action="store_true", help="Permit mission-authorized external actions")
+    host.add_argument("--plugin", action="append", default=[], help="Explicit installed seer_agent.plugins entry point")
     tools = commands.add_parser("tools", help="List explicitly registered tool contracts")
     tools.add_argument("--plugin", action="append", default=[])
     tools.add_argument("--demo", action="store_true")
@@ -84,6 +89,18 @@ async def run(args):
         store.close()
 
 
+async def host(args):
+    registry = builtin_registry()
+    for name in args.plugin:
+        registry.load_plugin(name)
+    args.db.parent.mkdir(parents=True, exist_ok=True)
+    store = Store(args.db)
+    try:
+        return await serve(Host(registry, store, output, allow_external=args.allow_external), sys.stdin)
+    finally:
+        store.close()
+
+
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
@@ -97,6 +114,8 @@ def main(argv=None):
             return 0
         if args.command == "run":
             return asyncio.run(run(args))
+        if args.command == "serve":
+            return asyncio.run(host(args))
         if not args.db.is_file() or not 1 <= args.limit <= 1000:
             raise ContractError("invalid_database_or_limit")
         store = Store(args.db)
