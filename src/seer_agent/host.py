@@ -7,7 +7,8 @@ import json
 import threading
 from typing import Callable, Iterable
 
-from .contracts import ContractError, Event, Mission
+from . import conversation
+from .contracts import ContractError, Event, MemoryView, Mission
 from .integrations import webhook
 from .integrations.http import HttpTransport
 from .runtime import Runtime, wall_time_ms
@@ -17,6 +18,9 @@ from .tools import Registry, Tool, ToolContext, ToolResult, ToolSpec
 PROTOCOL = 1
 MAX_MESSAGE_BYTES = 262144
 HEARTBEAT_MS = 2000
+# Host tools the app declares at hello to reach the cloud model for each conversation contract.
+MODEL_TOOLS = {"plan": "seer.model.plan", "ask": "seer.model.ask", "analysis": "seer.model.analysis"}
+MODEL_TIMEOUT_MS = 120000
 
 
 def harness_version() -> str:
@@ -62,9 +66,13 @@ class Host:
         self.pumps: dict[str, set[asyncio.Task]] = {}
         self.dirty: set[str] = set()
         self.sequence = 0
+        self.conversations: set[asyncio.Task] = set()
+        self.turns = 0
+        self.watching: dict[str, tuple[dict, list, object]] = {}
         self.handlers = {"hello": self.hello, "mission.open": self.open, "mission.close": self.close_mission,
                          "event": self.event, "coverage": self.coverage, "tool.result": self.tool_result,
-                         "incident.clear": self.clear, "shutdown": self.shutdown}
+                         "incident.clear": self.clear, "shutdown": self.shutdown, "plan": self.plan,
+                         "ask": self.ask, "analysis": self.analysis, "tool.progress": self.tool_progress}
 
     def send(self, kind: str, body: dict, reply_to=None) -> None:
         self.sequence += 1
@@ -146,7 +154,8 @@ class Host:
             self.registry.tool(tool)
         self.greeted = True
         stored = [row[0] for row in self.store.db.execute("SELECT id FROM missions ORDER BY id")]
-        self.send("ready", {"protocol": PROTOCOL, "harness_version": harness_version(), "missions": stored}, reply)
+        self.send("ready", {"protocol": PROTOCOL, "harness_version": harness_version(), "missions": stored,
+                            "contracts": conversation.CONTRACTS}, reply)
 
     @staticmethod
     def integration(item) -> Tool:
@@ -254,6 +263,66 @@ class Host:
         self.decisions(key)
         self.schedule(key)
 
+    def model(self, kind: str, request: dict, timeout_ms: int, reply=None):
+        """The cloud model for a conversation is a host tool; None when the app declared none."""
+        tool = self.registry.tools.get(MODEL_TOOLS[kind])
+        if tool is None:
+            return None
+
+        async def call(payload: dict) -> dict:
+            self.turns += 1
+            operation = f"conversation:{kind}:{request['conversation']}:{self.turns}"
+            event = Event(operation, "app", f"{kind}.request", self.clock(), payload, provenance="human")
+            context = ToolContext(operation, f"conversation.{kind}", event, MemoryView([]), self.clock()+timeout_ms)
+            if kind == "ask":
+                self.watching[operation] = (request, payload["scope"], reply)
+            try:
+                result = await asyncio.wait_for(tool.execute(context, payload), timeout_ms/1000)
+            finally:
+                self.watching.pop(operation, None)
+            if result.status != "succeeded":
+                raise ContractError("model_failed")
+            return result.data
+        return call
+
+    def converse(self, kind: str, body: dict, reply) -> None:
+        """Rules answer at once; a model call runs as its own task so tool.result can arrive meanwhile."""
+        timeout = min(integer(body.get("timeout_ms", MODEL_TIMEOUT_MS), minimum=1), 600000)
+        request = {key: value for key, value in body.items() if key != "timeout_ms"}
+        check = {"plan": conversation.check_plan_request, "ask": conversation.check_ask_request,
+                 "analysis": conversation.check_analysis_request}[kind]
+        check(request)
+        model = self.model(kind, request, timeout, reply)
+
+        async def run():
+            if kind == "plan":
+                result = await conversation.make_plan(request, model)
+            elif kind == "ask":
+                result = await conversation.answer_ask(request, model, lambda p: self.send("ask.progress", p, reply))
+            else:
+                result = await conversation.run_analysis(request, model)
+            self.send(f"{kind}.result", result, reply)
+        task = asyncio.get_running_loop().create_task(run())
+        self.conversations.add(task)
+        task.add_done_callback(self.conversations.discard)
+
+    async def plan(self, body: dict, reply) -> None:
+        self.converse("plan", body, reply)
+
+    async def ask(self, body: dict, reply) -> None:
+        self.converse("ask", body, reply)
+
+    async def analysis(self, body: dict, reply) -> None:
+        self.converse("analysis", body, reply)
+
+    async def tool_progress(self, body: dict, reply) -> None:
+        """The app reports how far the model has watched; Ask relays it as seer.ask progress."""
+        watch = self.watching.get(body.get("call")) if isinstance(body.get("call"), str) else None
+        if watch is None:
+            raise ContractError("unknown_call")
+        request, scope, origin = watch
+        self.send("ask.progress", conversation.ask_progress(request, scope, integer(body.get("done_ms"))), origin)
+
     async def shutdown(self, body: dict, reply) -> None:
         if self.stopping:
             raise ContractError("already_stopping")
@@ -328,7 +397,7 @@ class Host:
             await asyncio.sleep(interval_ms / 1000)
 
     async def close(self) -> None:
-        tasks = [task for tasks in self.pumps.values() for task in tasks]
+        tasks = [task for tasks in self.pumps.values() for task in tasks] + list(self.conversations)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

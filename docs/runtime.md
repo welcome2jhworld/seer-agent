@@ -44,7 +44,7 @@ Pending capacity is checked inside the ingestion transaction. Backpressure rolls
 
 | From the host | Body | Reply |
 |---|---|---|
-| `hello` | `protocol`, `app_version`, `clock_source`, `tools` (host tool specs), `integrations` (harness-run senders) | `ready` with `harness_version` and the missions in the store |
+| `hello` | `protocol`, `app_version`, `clock_source`, `tools` (host tool specs), `integrations` (harness-run senders) | `ready` with `harness_version`, the missions in the store and the conversation `contracts` versions |
 | `mission.open` | `mission` (versioned document), optional `after_revision` | `ack` with the mission state and latest decision `revision`, then every decision after `after_revision` |
 | `mission.close` | `mission` (identity and version) | `ack` |
 | `event` | `event` (Event envelope) | `ack` with a result per mission that lists the source |
@@ -52,6 +52,7 @@ Pending capacity is checked inside the ingestion transaction. Backpressure rolls
 | `tool.result` | `call`, `status`, `data`, `receipt` | `error` only: `unknown_call`, `call_expired`, or a contract code for a result that does not match the tool (recorded as unknown) |
 | `incident.clear` | `mission`, optional `event_id` | `ack` with the cancelled pending actions; an active incident records a `cleared` decision |
 | `shutdown` | optional `timeout_ms` | `ack` after pending work drains or the timeout passes |
+| `plan`, `ask`, `analysis`, `tool.progress` | conversation requests | see [conversation contracts](conversations.md#host-protocol) |
 
 After `ready`, the harness sends `heartbeat` every 2 s with pending work and health per mission, `tool.call` (`call`, `tool`, `mission`, `arguments`, `event`, `deadline_ms`) for host tools, `decision` (with its `revision`) for each condition transition and `error` with a `code`. Error messages never echo input.
 

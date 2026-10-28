@@ -34,6 +34,7 @@ def parser():
     host.add_argument("--db", required=True, type=Path)
     host.add_argument("--allow-external", action="store_true", help="Permit mission-authorized external actions")
     host.add_argument("--plugin", action="append", default=[], help="Explicit installed seer_agent.plugins entry point")
+    commands.add_parser("contracts", help="Print the versioned conversation contracts as JSON Schema")
     tools = commands.add_parser("tools", help="List explicitly registered tool contracts")
     tools.add_argument("--plugin", action="append", default=[])
     tools.add_argument("--demo", action="store_true")
@@ -132,6 +133,10 @@ def main(argv=None):
                 "code": str(error) if isinstance(error, ContractError) else "invalid_input_or_storage"}})
             return 2
     try:
+        if args.command == "contracts":
+            from .conversation import CONTRACTS, SCHEMAS
+            output({name: {"version": CONTRACTS.get(name, 1), "schema": schema} for name, schema in SCHEMAS.items()})
+            return 0
         if args.command == "tools":
             registry = demo_registry() if args.demo else builtin_registry()
             for name in args.plugin:
