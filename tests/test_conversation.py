@@ -52,7 +52,8 @@ def test_a_quick_reply_answers_the_one_question_without_a_model():
     first = run(make_plan(plan_request(example=example())))
     second = run(make_plan(plan_request(previous=first, reply={"question": "response", "choice": "record"})))
     assert second["revision"] == 2 and second["response"] == "record" and second["question"] is None
-    assert second["mission"]["version"] == 2 and second["goal"] == first["goal"]
+    assert second["mission"]["version"] == 2 and second["goal"] == "Record when a person stays in Gate area for 10 seconds or more."
+    assert second["mission"]["purpose"] == second["goal"] and first["mission"]["purpose"].startswith("Alert when")
 
 
 def test_free_words_need_seer_cloud_and_offer_examples_from_the_users_cameras():
@@ -199,10 +200,11 @@ def analysis_request(**body):
 
 
 def test_the_first_search_offers_the_last_24_hours_with_a_credit_estimate():
-    offer = analysis_offer(analysis_request(credits_per_camera_hour=5))
+    assert analysis_offer(analysis_request(credits_per_camera_hour=5)) is None
+    offer = analysis_offer(analysis_request(credits_per_camera_hour=5, first_search=True))
     assert offer["status"] == "offer_indexing" and offer["offer"]["cameras"] == ["cam-side"]
     assert offer["offer"]["credits"] == 120 and offer["offer"]["to_ms"] - offer["offer"]["from_ms"] == 24 * HOUR
-    assert analysis_offer(analysis_request())["offer"]["credits"] is None
+    assert analysis_offer(analysis_request(first_search=True))["offer"]["credits"] is None
     started = analysis_offer(analysis_request(choice="last_24_hours"))
     assert started["status"] == "indexing" and started["indexing"]["cameras"] == ["cam-side"]
 
@@ -239,7 +241,10 @@ def test_answers_with_clips_no_matches_and_clips_outside_coverage():
 
 def test_nothing_indexed_is_not_the_same_as_no_matches():
     request = analysis_request(choice="from_now", scope={"cameras": ["cam-side"], "from_ms": NOW - HOUR, "to_ms": NOW})
-    assert run(run_analysis(request))["status"] == "not_indexed"
+
+    async def model(payload):
+        raise AssertionError("not called")
+    assert run(run_analysis(request, model))["status"] == "not_indexed"
 
 
 # Host protocol
@@ -329,3 +334,131 @@ def test_every_contract_schema_is_valid_json_schema():
     for name, schema in SCHEMAS.items():
         Draft202012Validator.check_schema(schema)
     assert set(CONTRACTS) <= set(SCHEMAS) and object_schema({})["additionalProperties"] is False
+
+
+# R1 review of 40d86a1
+
+async def host_replies(tmp_path, tools, messages):
+    h = Harness(tmp_path, tools)
+    await h.send("hello", {"protocol": 1, "tools": h.tools}, "hello")
+    for kind, body, ident in messages:
+        await h.send(kind, body, ident)
+    await asyncio.sleep(0.05)
+    h.store.close()
+    return h
+
+
+def replies(h, ident):
+    return [(m["type"], m["body"].get("status") or m["body"].get("code")) for m in h.out if m.get("reply_to") == ident]
+
+
+def test_every_plan_request_gets_a_reply_never_silence(tmp_path):
+    first = run(make_plan(plan_request(example=example())))
+    long_id = {**plan_request(example=example()), "conversation": "c" * 156}
+    h = asyncio.run(host_replies(tmp_path, [], [
+        ("plan", plan_request(previous=first, reply={"question": "response", "choice": "nope"}), "choice"),
+        ("plan", plan_request(example=example(), previous={}), "empty"),
+        ("plan", plan_request(tier="cloud", text="x", previous={"revision": "two"}), "revision"),
+        ("plan", long_id, "long")]))
+    assert replies(h, "choice") == [("error", "unknown_reply")]
+    assert [r[0] for r in replies(h, "empty")] == ["error"] and [r[0] for r in replies(h, "revision")] == ["error"]
+    assert [r[0] for r in replies(h, "long")] == ["error"]
+
+
+def test_a_model_card_cannot_reuse_the_alert_or_record_question_with_other_answers():
+    card = cloud_plan(cloud_candidate(question={"id": "response", "text": "How should I tell you?",
+                                               "replies": [{"id": "sms", "label": "Text me"}]}))
+    assert card["status"] == "failed" and card["failure"]["code"] == "plan_failed"
+
+
+def test_a_reply_to_the_planners_own_question_goes_back_to_the_planner():
+    asked = cloud_candidate(question={"id": "door", "text": "Which door?",
+                                      "replies": [{"id": "left", "label": "Left door"}, {"id": "right", "label": "Right door"}]})
+    calls = []
+
+    async def planner(payload):
+        calls.append(payload)
+        return asked if len(calls) == 1 else cloud_candidate(goal="Alert when a person stays at the left door for 10 seconds or more.")
+    card = run(make_plan(plan_request(tier="cloud", text="Watch the door."), planner))
+    second = run(make_plan(plan_request(tier="cloud", previous=card, reply={"question": "door", "choice": "left"}), planner))
+    assert len(calls) == 2 and calls[1]["request"]["reply"] == {"question": "door", "choice": "left"} and calls[1]["revision"] == 2
+    assert second["revision"] == 2 and "left door" in second["goal"]
+
+
+def test_free_card_text_follows_the_response_and_the_exact_dwell():
+    record = run(make_plan(plan_request(example=example(response="record"))))
+    assert record["goal"].startswith("Record when") and record["question"] is None and record["mission"]["purpose"] == record["goal"]
+    odd = run(make_plan(plan_request(example=example(dwell_s=150))))
+    assert "150 seconds" in odd["goal"] and odd["mission"]["condition"]["config"]["dwell_ms"] == 150000
+    assert "2 minutes" in run(make_plan(plan_request(example=example(dwell_s=120))))["goal"]
+
+
+def test_an_abbreviation_does_not_end_the_goal_but_a_second_sentence_does():
+    assert cloud_plan(cloud_candidate(goal="Alert when a car stops at the gate after 9 p.m. on weekdays."))["status"] == "ready"
+    assert cloud_plan(cloud_candidate(goal="Alert when a car stops. Then call me."))["status"] == "failed"
+    assert cloud_plan(cloud_candidate(goal="정문에 차가 서면 알림. 그리고 전화."))["status"] == "failed"
+
+
+def test_analysis_needs_the_cloud_tool_before_offering_and_offers_only_on_the_first_search(tmp_path):
+    h = asyncio.run(host_replies(tmp_path, [], [
+        ("analysis", analysis_request(first_search=True, credits_per_camera_hour=5), "free"),
+        ("analysis", analysis_request(choice="last_24_hours"), "free-choice")]))
+    assert replies(h, "free") == [("analysis.result", "needs_cloud")] and replies(h, "free-choice") == [("analysis.result", "needs_cloud")]
+
+    async def model(payload):
+        return {"text": "A truck arrived.", "clips": [found(1)]}
+    later = run(run_analysis(analysis_request(), model))
+    assert later["status"] == "answered" and later["coverage"]["not_indexed"][-1]["camera"] == "cam-side"
+
+
+def test_model_output_stays_inside_what_was_searched_or_watched():
+    async def long_clip(payload):
+        return {"text": "x", "clips": [{**found(0.5), "length_ms": 86400000}]}
+    assert run(run_analysis(analysis_request(choice="from_now"), long_clip))["status"] == "failed"
+
+    first, second = clip(30, 5), clip(10, 5)
+
+    async def bridging_gap(payload):
+        return {"status": "answered", "text": "x", "moments": [],
+                "not_available": [{"camera": "cam-main", "from_ms": first["from_ms"], "to_ms": second["to_ms"]}]}
+    assert run(answer_ask(ask_request(attachments=[first, second]), bridging_gap))["status"] == "failed"
+
+    duplicate = analysis_request(index=[{"camera": "cam-main", "indexed_from_ms": None}, {"camera": "cam-main", "indexed_from_ms": NOW}])
+    with pytest.raises(ContractError):
+        run(run_analysis(duplicate))
+    with pytest.raises(ContractError):
+        run(make_plan(plan_request(cameras=CAMERAS + [CAMERAS[0]], example=example())))
+
+
+def test_ask_progress_names_the_range_it_has_reached():
+    from seer_agent.conversation import ask_progress
+    first, second = clip(30, 5), clip(10, 5)
+    request = ask_request(attachments=[first, second])
+    scope, _ = ask_scope(request)
+    assert ask_progress(request, scope, 60000)["watching"]["from_ms"] == first["from_ms"]
+    assert ask_progress(request, scope, 360000)["watching"]["from_ms"] == second["from_ms"]
+
+
+def test_shutdown_answers_open_conversations_and_refuses_new_ones(tmp_path):
+    async def go():
+        h = Harness(tmp_path, ["seer.model.ask"])
+        await h.send("hello", {"protocol": 1, "tools": h.tools}, "hello")
+        await h.send("ask", ask_request(), "open")
+        await h.send("shutdown", {"timeout_ms": 10}, "stop")
+        await asyncio.sleep(0.1)
+        await h.send("plan", plan_request(example=example()), "late")
+        result = [m for m in h.out if m.get("reply_to") == "open" and m["type"] == "ask.result"]
+        assert result and result[0]["body"]["failure"]["code"] == "stopped"
+        assert replies(h, "late") == [("error", "stopping")] and h.host.done.is_set()
+        ack = [i for i, m in enumerate(h.out) if m.get("reply_to") == "stop"]
+        assert ack and ack[0] > h.out.index(result[0])
+        h.store.close()
+    asyncio.run(go())
+
+
+def test_the_model_call_carries_the_request_once(tmp_path):
+    big = "w" * 2000
+    h = asyncio.run(host_replies(tmp_path, ["seer.model.plan"], [
+        ("plan", plan_request(tier="cloud", text=big, cameras=[{"id": f"cam-{i}", "name": "n" * 60} for i in range(64)]), "p")]))
+    call = [m for m in h.out if m["type"] == "tool.call"][0]["body"]
+    assert call["arguments"]["request"]["text"] == big and call["event"]["data"] == {"conversation": "t1"}

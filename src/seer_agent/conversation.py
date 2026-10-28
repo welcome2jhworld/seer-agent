@@ -17,6 +17,7 @@ CONTRACTS = {"seer.task_plan": 1, "seer.ask": 1, "seer.analysis": 1}
 ASK_WINDOW_MS = 600000
 INDEX_OFFER_MS = 86400000
 
+CONVERSATION = {**ID, "maxLength": 120}
 LABEL = {"type": "string", "minLength": 1, "maxLength": 60}
 LINE = {"type": "string", "minLength": 1, "maxLength": 200}
 WORDS = {"type": "string", "minLength": 1, "maxLength": 2000}
@@ -42,8 +43,32 @@ def note(code: str, text: str) -> dict:
     return {"code": code, "text": text}
 
 
+ABBREVIATIONS = {"a.m", "p.m", "e.g", "i.e", "etc", "vs", "mr", "mrs", "ms", "dr", "st", "no", "approx"}
+
+
 def sentences(text: str) -> int:
-    return len([part for part in re.split(r"(?<=[.!?])\s+", text.strip()) if part])
+    """A sentence ends at . ! or ? followed by space and anything but a lowercase Latin letter, unless the
+    word before the period is a known abbreviation ("9 p.m. on weekdays", "e.g. Main gate")."""
+    count, start = 1, 0
+    text = text.strip()
+    for match in re.finditer(r"[.!?]\s+(?=[^a-z])", text):
+        word = text[start:match.start()].rsplit(None, 1)[-1].lower() if text[start:match.start()].strip() else ""
+        if match.group(0)[0] == "." and word.rstrip(".") in ABBREVIATIONS:
+            continue
+        count, start = count + 1, match.end()
+    return count if text else 0
+
+
+def unique_cameras(cameras: list[dict]) -> set[str]:
+    ids = [c["id"] for c in cameras]
+    if len(set(ids)) != len(ids):
+        raise ContractError("duplicate_camera")
+    return set(ids)
+
+
+def contained(item: dict, ranges: list[dict]) -> bool:
+    """The whole range sits inside one range of the same camera."""
+    return any(r["camera"] == item["camera"] and r["from_ms"] <= item["from_ms"] <= item["to_ms"] <= r["to_ms"] for r in ranges)
 
 
 def ranges_valid(ranges: list[dict]) -> None:
@@ -88,15 +113,15 @@ PLAN_BODY = {
     "response": {"enum": ["alert", "record"]},
 }
 TASK_PLAN = object_schema({
-    **head("seer.task_plan"), "conversation": ID, "revision": {"type": "integer", "minimum": 1},
+    **head("seer.task_plan"), "conversation": CONVERSATION, "revision": {"type": "integer", "minimum": 1},
     "status": {"enum": ["ready", "unsupported", "needs_cloud", "failed"]},
     **PLAN_BODY, "local_only": {"type": "boolean"},
     "alternative": object_schema({"reason": NOTE, "suggestion": LINE, "example": EXAMPLE}, ["reason", "suggestion"]),
-    "examples": {"type": "array", "items": EXAMPLE, "maxItems": 3},
+    "examples": {"type": "array", "items": EXAMPLE, "maxItems": 3}, "example": EXAMPLE,
     "failure": NOTE, "notice": NOTE, "mission": {"type": "object"},
 }, ["contract", "version", "conversation", "revision", "status"])
 PLAN_REQUEST = object_schema({
-    **head("seer.plan_request"), "conversation": ID, "tier": {"enum": ["free", "cloud"]}, "cameras": CAMERAS,
+    **head("seer.plan_request"), "conversation": CONVERSATION, "tier": {"enum": ["free", "cloud"]}, "cameras": CAMERAS,
     "text": WORDS, "example": EXAMPLE, "previous": {"type": "object"},
     "reply": {"oneOf": [object_schema({"question": ID, "choice": ID}), object_schema({"text": WORDS})]},
 }, ["contract", "version", "conversation", "tier", "cameras"])
@@ -112,19 +137,32 @@ NEEDS_CLOUD = note("needs_cloud", "Describing a task in your own words needs See
 
 
 def check_plan_request(request: dict) -> dict:
+    """Everything that could fail later is checked here, so a valid request always gets a card."""
     validate(PLAN_REQUEST, request)
+    ids = unique_cameras(request["cameras"])
     asks = [key for key in ("text", "example", "reply") if key in request]
     if len(asks) != 1:
         raise ContractError("plan_request_needs_one_of_text_example_reply")
-    if "reply" in request:
-        if "previous" not in request:
-            raise ContractError("reply_needs_previous_plan")
-        validate(TASK_PLAN, request["previous"])
-        if request["previous"]["conversation"] != request["conversation"]:
+    if "reply" in request and "previous" not in request:
+        raise ContractError("reply_needs_previous_plan")
+    if "previous" in request:
+        previous = request["previous"]
+        validate(TASK_PLAN, previous)
+        if previous["conversation"] != request["conversation"]:
             raise ContractError("reply_to_another_conversation")
-    if "example" in request and request["example"]["camera"] not in {c["id"] for c in request["cameras"]}:
+        reply = request.get("reply", {})
+        if "choice" in reply:
+            question = previous.get("question")
+            if (not question or reply["question"] != question["id"]
+                    or reply["choice"] not in {r["id"] for r in question["replies"]}):
+                raise ContractError("unknown_reply")
+    if "example" in request and request["example"]["camera"] not in ids:
         raise ContractError("unknown_camera")
     return request
+
+
+def plan_revision(request: dict) -> int:
+    return request["previous"]["revision"] + 1 if "previous" in request else 1
 
 
 def plan(conversation: str, revision: int, status: str, **body) -> dict:
@@ -154,24 +192,25 @@ def example_plan(request: dict, revision: int = 1) -> dict:
     title_who = " or ".join(EXAMPLE_LABELS[label][3] for label in labels)
     tools = [{"id": EXAMPLE_LABELS[label][0], "label": TOOLS[EXAMPLE_LABELS[label][0]][0]} for label in labels]
     place = "the view" if zone == WHOLE_VIEW else zone["name"]
+    response = example.get("response")
+    verb = "Record" if response == "record" else "Alert"
     if example["kind"] == "time_in_area":
         seconds = example.get("dwell_s", 10)
-        span = f"{seconds} seconds" if seconds < 120 else f"{seconds // 60} minutes"
-        goal = f"Alert when {who} stays in {place} for {span} or more."
+        span = f"{seconds // 60} minutes" if seconds >= 120 and seconds % 60 == 0 else f"{seconds} seconds"
+        goal = f"{verb} when {who} stays in {place} for {span} or more."
         title = f"{title_who} stays in {place}"
         tools.append({"id": "time_in_area", "label": TOOLS["time_in_area"][0]})
         reasoning = (f"I start counting when the bottom of the box is inside {place}, and keep counting through "
                      f"up to 10 seconds of being hidden. Other objects are ignored.")
     else:
-        goal = f"Alert when {who} enters {place}."
+        goal = f"{verb} when {who} enters {place}."
         title = f"{title_who} in {place}"
         tools.append({"id": "zone_entry", "label": TOOLS["zone_entry"][0]})
         reasoning = f"An entry counts when the bottom of the box is inside {place}. Other objects are ignored."
-    response = example.get("response")
     body = {"title": title[:60], "goal": goal, "input": {"camera": camera["id"], "camera_name": camera["name"],
             "zone": zone, "hours": example.get("hours", {"all_day": True})}, "tools": tools, "reasoning": reasoning,
             "question": None if response else copy.deepcopy(ACTION_QUESTION), "response": response or "alert",
-            "local_only": True}
+            "local_only": True, "example": copy.deepcopy(example)}
     result = plan(request["conversation"], revision, "ready", **body)
     result["mission"] = compile_mission(result, example)
     return result
@@ -191,6 +230,9 @@ def check_plan_candidate(candidate: Any, request: dict, revision: int) -> dict:
             return plan(conversation, revision, "unsupported", alternative=alternative)
         if sentences(candidate["goal"]) != 1 or sentences(candidate["reasoning"]) > 2:
             raise ContractError("plan_text_too_long")
+        question = candidate["question"]
+        if question and question["id"] == "response" and not {r["id"] for r in question["replies"]} <= {"alert", "record"}:
+            raise ContractError("reserved_question")
         names = {c["id"]: c["name"] for c in request["cameras"]}
         if candidate["input"]["camera"] not in names or candidate["input"]["camera_name"] != names[candidate["input"]["camera"]]:
             raise ContractError("unknown_camera")
@@ -207,22 +249,12 @@ def check_plan_candidate(candidate: Any, request: dict, revision: int) -> dict:
 
 
 def answer_plan(request: dict) -> dict | None:
-    """A quick reply to the plan's one question is applied here; anything else needs the planner."""
+    """Only a free card's alert-or-record reply is applied here: the card is rebuilt from its example, so the
+    goal and the mission follow the answer. Every other reply goes to the planner."""
     previous, reply = request["previous"], request["reply"]
-    question = previous.get("question")
-    if "choice" not in reply or not question or reply["question"] != question["id"]:
+    if "choice" not in reply or reply["question"] != "response" or "example" not in previous:
         return None
-    if reply["choice"] not in {r["id"] for r in question["replies"]}:
-        raise ContractError("unknown_reply")
-    body = {key: previous[key] for key in (*PLAN_BODY, "local_only") if key in previous}
-    if question["id"] == "response":
-        body["response"] = reply["choice"]
-    body["question"] = None
-    result = plan(previous["conversation"], previous["revision"] + 1, "ready", **body)
-    if "mission" in previous:
-        result["mission"] = {**previous["mission"], "version": result["revision"]}
-        Mission.from_dict(result["mission"])
-    return result
+    return example_plan({**request, "example": {**previous["example"], "response": reply["choice"]}}, previous["revision"] + 1)
 
 
 def compile_mission(card: dict, example: dict) -> dict:
@@ -255,7 +287,7 @@ ATTACHMENT = {"oneOf": [
 ]}
 TURN = object_schema({"role": {"enum": ["you", "seer"]}, "text": WORDS})
 ASK_REQUEST = object_schema({
-    **head("seer.ask_request"), "conversation": ID, "now_ms": TIME, "text": WORDS, "cameras": CAMERAS,
+    **head("seer.ask_request"), "conversation": CONVERSATION, "now_ms": TIME, "text": WORDS, "cameras": CAMERAS,
     "attachments": {"type": "array", "items": ATTACHMENT, "maxItems": 8},
     "history": {"type": "array", "items": TURN, "maxItems": 20},
 }, ["contract", "version", "conversation", "now_ms", "text", "cameras"])
@@ -264,7 +296,7 @@ FOLLOW_UPS = {"type": "array", "items": {"type": "string", "minLength": 1, "maxL
 ASK_COVERAGE = object_schema({"watched": {"type": "array", "items": RANGE, "maxItems": 64},
                               "not_available": {"type": "array", "items": RANGE, "maxItems": 64}})
 ASK = object_schema({
-    **head("seer.ask"), "conversation": ID, "kind": {"enum": ["progress", "answer"]},
+    **head("seer.ask"), "conversation": CONVERSATION, "kind": {"enum": ["progress", "answer"]},
     "status": {"enum": ["watching", "answered", "handoff", "needs_cloud", "failed"]},
     "watching": RANGE, "done_ms": TIME, "total_ms": TIME,
     "text": {"type": "string", "minLength": 1, "maxLength": 1200},
@@ -285,7 +317,7 @@ ASK_NEEDS_CLOUD = note("needs_cloud", "Asking about your cameras needs Seer Clou
 
 def check_ask_request(request: dict) -> dict:
     validate(ASK_REQUEST, request)
-    ids = {c["id"] for c in request["cameras"]}
+    ids = unique_cameras(request["cameras"])
     for item in request.get("attachments", []):
         if item["kind"] in {"camera", "clip"} and item["camera"] not in ids:
             raise ContractError("unknown_camera")
@@ -331,7 +363,7 @@ def check_ask_candidate(candidate: Any, request: dict, scope: list[dict]) -> dic
                 raise ContractError("moment_outside_scope")
         gaps = candidate.get("not_available", [])
         ranges_valid(gaps)
-        if any(not within(g["from_ms"], g["camera"], scope) or not within(g["to_ms"], g["camera"], scope) for g in gaps):
+        if not all(contained(g, scope) for g in gaps):
             raise ContractError("gap_outside_scope")
         return ask(conversation, "answer", "answered", text=candidate["text"],
                    moments=sorted(candidate["moments"], key=lambda m: m["at_ms"]),
@@ -341,19 +373,26 @@ def check_ask_candidate(candidate: Any, request: dict, scope: list[dict]) -> dic
 
 
 def ask_progress(request: dict, scope: list[dict], done_ms: int) -> dict:
+    """done_ms counts through the watched ranges in order; watching is the range it has reached."""
     total = sum(r["to_ms"] - r["from_ms"] for r in scope)
-    return ask(request["conversation"], "progress", "watching", watching=scope[0], done_ms=min(done_ms, total), total_ms=total)
+    done, passed, current = min(done_ms, total), 0, scope[-1]
+    for item in scope:
+        if done < passed + (item["to_ms"] - item["from_ms"]):
+            current = item
+            break
+        passed += item["to_ms"] - item["from_ms"]
+    return ask(request["conversation"], "progress", "watching", watching=current, done_ms=done, total_ms=total)
 
 
 # Analysis (D17, D38): searches indexed footage, says what was searched, offers to index the rest
 
 INDEX = object_schema({"camera": ID, "indexed_from_ms": {"oneOf": [{"type": "null"}, TIME]}})
 ANALYSIS_REQUEST = object_schema({
-    **head("seer.analysis_request"), "conversation": ID, "now_ms": TIME, "text": WORDS, "cameras": CAMERAS,
+    **head("seer.analysis_request"), "conversation": CONVERSATION, "now_ms": TIME, "text": WORDS, "cameras": CAMERAS,
     "scope": object_schema({"cameras": {"type": "array", "items": ID, "minItems": 1, "maxItems": 64, "uniqueItems": True},
                             "from_ms": TIME, "to_ms": TIME}),
     "index": {"type": "array", "items": INDEX, "maxItems": 64},
-    "choice": {"enum": ["last_24_hours", "from_now"]},
+    "choice": {"enum": ["last_24_hours", "from_now"]}, "first_search": {"type": "boolean"},
     "credits_per_camera_hour": {"type": "number", "minimum": 0, "maximum": 1000000},
 }, ["contract", "version", "conversation", "now_ms", "text", "cameras", "scope", "index"])
 CLIP = object_schema({"id": ID, "camera": ID, "at_ms": TIME, "length_ms": {"type": "integer", "minimum": 0, "maximum": 86400000},
@@ -364,7 +403,7 @@ OFFER = object_schema({"cameras": {"type": "array", "items": ID, "minItems": 1, 
                        "credits": {"oneOf": [{"type": "null"}, {"type": "integer", "minimum": 0}]},
                        "choices": {"type": "array", "items": {"enum": ["last_24_hours", "from_now"]}, "minItems": 2, "maxItems": 2}})
 ANALYSIS = object_schema({
-    **head("seer.analysis"), "conversation": ID,
+    **head("seer.analysis"), "conversation": CONVERSATION,
     "status": {"enum": ["answered", "no_matches", "not_indexed", "offer_indexing", "indexing", "needs_cloud", "failed"]},
     "text": {"type": "string", "minLength": 1, "maxLength": 1200}, "clips": {"type": "array", "items": CLIP, "maxItems": 24},
     "coverage": SEARCH_COVERAGE, "follow_ups": FOLLOW_UPS, "offer": OFFER, "failure": NOTE, "notice": NOTE,
@@ -378,10 +417,12 @@ ANALYSIS_NEEDS_CLOUD = note("needs_cloud", "Searching recorded footage needs See
 
 def check_analysis_request(request: dict) -> dict:
     validate(ANALYSIS_REQUEST, request)
-    ids = {c["id"] for c in request["cameras"]}
-    scope = request["scope"]
-    if not set(scope["cameras"]) <= ids or any(i["camera"] not in ids for i in request["index"]):
+    ids = unique_cameras(request["cameras"])
+    scope, indexed = request["scope"], [i["camera"] for i in request["index"]]
+    if not set(scope["cameras"]) <= ids or not set(indexed) <= ids:
         raise ContractError("unknown_camera")
+    if len(set(indexed)) != len(indexed):
+        raise ContractError("duplicate_index")
     if not scope["from_ms"] <= scope["to_ms"] <= request["now_ms"]:
         raise ContractError("invalid_range")
     return request
@@ -411,9 +452,12 @@ def search_coverage(request: dict) -> dict:
 
 
 def analysis_offer(request: dict) -> dict | None:
-    """The first search over cameras with no index at all offers the last 24 hours or from now (D17).
-    The credit estimate comes only from the rate the app supplies; the harness invents no prices."""
+    """The first search (the app says so with first_search) over cameras with no index at all offers the
+    last 24 hours or from now (D17). Later searches answer from what is indexed and list the rest as not
+    indexed. The credit estimate comes only from the rate the app supplies; the harness invents no prices."""
     conversation = request["conversation"]
+    if not request.get("first_search") and "choice" not in request:
+        return None
     unindexed = [c for c in request["scope"]["cameras"]
                  if next((i["indexed_from_ms"] for i in request["index"] if i["camera"] == c), None) is None]
     if not unindexed:
@@ -436,8 +480,9 @@ def check_analysis_candidate(candidate: Any, request: dict, coverage: dict) -> d
     try:
         validate(ANALYSIS_CANDIDATE, candidate)
         for clip in candidate["clips"]:
-            if (clip["frame"]["camera"] != clip["camera"] or not within(clip["at_ms"], clip["camera"], coverage["searched"])
-                    or not within(clip["frame"]["at_ms"], clip["camera"], coverage["searched"])):
+            span = {"camera": clip["camera"], "from_ms": clip["at_ms"], "to_ms": clip["at_ms"] + clip["length_ms"]}
+            if (clip["frame"]["camera"] != clip["camera"] or not contained(span, coverage["searched"])
+                    or not span["from_ms"] <= clip["frame"]["at_ms"] <= span["to_ms"]):
                 raise ContractError("clip_outside_coverage")
         status = "answered" if candidate["clips"] else "no_matches"
         return analysis(conversation, status, text=candidate["text"], clips=sorted(candidate["clips"], key=lambda c: c["at_ms"]),
@@ -447,13 +492,23 @@ def check_analysis_candidate(candidate: Any, request: dict, coverage: dict) -> d
 
 
 CLOUD_UNAVAILABLE = note("cloud_unavailable", "Couldn't reach Seer Cloud.")
+STOPPED = note("stopped", "Seer stopped before answering.")
+
+
+def failed(kind: str, request: dict, reason: dict) -> dict:
+    """The contract's failure for a request that already passed its checks."""
+    conversation = request["conversation"]
+    if kind == "plan":
+        return plan(conversation, plan_revision(request), "failed", failure=reason)
+    if kind == "ask":
+        return ask(conversation, "answer", "failed", failure=reason)
+    return analysis(conversation, "failed", failure=reason)
 
 
 async def make_plan(request: dict, planner=None) -> dict:
     """planner(payload) -> candidate is the cloud model, called only when no rule can answer."""
     check_plan_request(request)
-    conversation, previous = request["conversation"], request.get("previous")
-    revision = previous["revision"] + 1 if previous else 1
+    conversation, revision = request["conversation"], plan_revision(request)
     if "example" in request:
         return example_plan(request, revision)
     if "reply" in request and (quick := answer_plan(request)) is not None:
@@ -488,14 +543,14 @@ async def answer_ask(request: dict, model=None, progress=None) -> dict:
 
 async def run_analysis(request: dict, model=None) -> dict:
     check_analysis_request(request)
+    coverage = search_coverage(request)
+    if model is None:
+        return analysis(request["conversation"], "needs_cloud", notice=ANALYSIS_NEEDS_CLOUD, coverage=coverage)
     offer = analysis_offer(request)
     if offer is not None:
         return offer
-    coverage = search_coverage(request)
     if not coverage["searched"]:
         return analysis(request["conversation"], "not_indexed", coverage=coverage)
-    if model is None:
-        return analysis(request["conversation"], "needs_cloud", notice=ANALYSIS_NEEDS_CLOUD, coverage=coverage)
     try:
         candidate = await model({"request": request, "coverage": coverage})
     except Exception:
@@ -508,7 +563,7 @@ SCHEMAS = {"seer.plan_request": PLAN_REQUEST, "seer.task_plan": TASK_PLAN, "seer
            "seer.analysis_request": ANALYSIS_REQUEST, "seer.analysis": ANALYSIS,
            "seer.analysis_candidate": ANALYSIS_CANDIDATE}
 
-__all__ = ["CONTRACTS", "SCHEMAS", "TOOLS", "ASK_WINDOW_MS", "make_plan", "answer_ask", "run_analysis", "check_plan_request", "example_plan", "examples",
+__all__ = ["CONTRACTS", "SCHEMAS", "TOOLS", "ASK_WINDOW_MS", "make_plan", "answer_ask", "run_analysis", "failed", "STOPPED", "check_plan_request", "example_plan", "examples",
            "check_plan_candidate", "answer_plan", "compile_mission", "check_ask_request", "ask_scope",
            "check_ask_candidate", "ask_progress", "check_analysis_request", "search_coverage", "analysis_offer",
            "check_analysis_candidate", "plan", "ask", "analysis", "NEEDS_CLOUD", "ASK_NEEDS_CLOUD",

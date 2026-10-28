@@ -272,7 +272,8 @@ class Host:
         async def call(payload: dict) -> dict:
             self.turns += 1
             operation = f"conversation:{kind}:{request['conversation']}:{self.turns}"
-            event = Event(operation, "app", f"{kind}.request", self.clock(), payload, provenance="human")
+            event = Event(operation, "app", f"{kind}.request", self.clock(),
+                          {"conversation": request["conversation"]}, provenance="human")
             context = ToolContext(operation, f"conversation.{kind}", event, MemoryView([]), self.clock()+timeout_ms)
             if kind == "ask":
                 self.watching[operation] = (request, payload["scope"], reply)
@@ -286,7 +287,11 @@ class Host:
         return call
 
     def converse(self, kind: str, body: dict, reply) -> None:
-        """Rules answer at once; a model call runs as its own task so tool.result can arrive meanwhile."""
+        """Rules answer at once; a model call runs as its own task so tool.result can arrive meanwhile.
+        A request that passes its checks always gets a result: an error or a stop becomes the contract's
+        failure, never silence."""
+        if self.stopping:
+            raise ContractError("stopping")
         timeout = min(integer(body.get("timeout_ms", MODEL_TIMEOUT_MS), minimum=1), 600000)
         request = {key: value for key, value in body.items() if key != "timeout_ms"}
         check = {"plan": conversation.check_plan_request, "ask": conversation.check_ask_request,
@@ -295,12 +300,20 @@ class Host:
         model = self.model(kind, request, timeout, reply)
 
         async def run():
-            if kind == "plan":
-                result = await conversation.make_plan(request, model)
-            elif kind == "ask":
-                result = await conversation.answer_ask(request, model, lambda p: self.send("ask.progress", p, reply))
-            else:
-                result = await conversation.run_analysis(request, model)
+            try:
+                if kind == "plan":
+                    result = await conversation.make_plan(request, model)
+                elif kind == "ask":
+                    result = await conversation.answer_ask(request, model, lambda p: self.send("ask.progress", p, reply))
+                else:
+                    result = await conversation.run_analysis(request, model)
+            except asyncio.CancelledError:
+                self.send(f"{kind}.result", conversation.failed(kind, request, conversation.STOPPED), reply)
+                raise
+            except Exception:
+                reason = {"plan": conversation.PLAN_FAILED, "ask": conversation.ASK_FAILED,
+                          "analysis": conversation.ANALYSIS_FAILED}[kind]
+                result = conversation.failed(kind, request, reason)
             self.send(f"{kind}.result", result, reply)
         task = asyncio.get_running_loop().create_task(run())
         self.conversations.add(task)
@@ -330,10 +343,15 @@ class Host:
         self.stopping = True
 
         async def drain():
-            # Tool results keep arriving while pending work drains.
+            # Tool results keep arriving while pending work and open conversations drain.
             pending = [task for tasks in self.pumps.values() for task in tasks if not task.done()]
+            pending += [task for task in self.conversations if not task.done()]
             if pending:
                 await asyncio.wait(pending, timeout=timeout)
+            stopped = [task for task in self.conversations if not task.done()]
+            for task in stopped:
+                task.cancel()
+            await asyncio.gather(*stopped, return_exceptions=True)
             self.send("ack", {}, reply)
             self.done.set()
         asyncio.get_running_loop().create_task(drain())
