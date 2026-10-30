@@ -60,7 +60,8 @@ SCHEMA = """
     CREATE TABLE IF NOT EXISTS estimates(
         id TEXT PRIMARY KEY, situation_id TEXT NOT NULL, observation_id TEXT NOT NULL,
         hypothesis_id TEXT NOT NULL, from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL,
-        committed_ms INTEGER NOT NULL, current INTEGER NOT NULL, placement TEXT NOT NULL, reason TEXT NOT NULL);
+        committed_ms INTEGER NOT NULL, current INTEGER NOT NULL, placement TEXT NOT NULL, reason TEXT NOT NULL,
+        demoted_ms INTEGER);
     CREATE TABLE IF NOT EXISTS checks(
         id TEXT PRIMARY KEY, situation_id TEXT NOT NULL, kind TEXT NOT NULL, separates TEXT NOT NULL,
         from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL, created_ms INTEGER NOT NULL, status TEXT NOT NULL);
@@ -88,10 +89,12 @@ class ReplayStore:
 
     The last committed cutoff is persisted in `meta`; a store cannot be opened with a clock behind
     it, so a successor never reads commits from its own future. Read models filter by committed time
-    as a second guard."""
+    as a second guard. Every transaction is fenced: it commits only at or after the committed cutoff
+    and only for the store's latest owner epoch, so a superseded owner can no longer write."""
 
     def __init__(self, path: str | Path, clock: CausalClock):
         self.clock = clock
+        self.owner_epoch: int | None = None  # set by the owning ReplayCore once it has taken its epoch
         self.db = sqlite3.connect(path, isolation_level=None, timeout=5)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -106,10 +109,21 @@ class ReplayStore:
         if clock.now_ms < committed:
             raise CausalViolation(f"clock_behind_committed_cutoff:{clock.now_ms}<{committed}")
 
+    def fence(self) -> None:
+        """Refuse a commit from behind the committed cutoff or from an owner that is no longer the latest."""
+        committed = int(self.meta("cutoff_ms", "0"))
+        if self.clock.now_ms < committed:
+            raise CausalViolation(f"clock_behind_committed_cutoff:{self.clock.now_ms}<{committed}")
+        if self.owner_epoch is not None:
+            latest = self.row("SELECT COALESCE(MAX(epoch),0) AS epoch FROM owners")["epoch"]
+            if latest != self.owner_epoch:
+                raise ContractError("owner_superseded")
+
     @contextmanager
     def transaction(self):
         self.db.execute("BEGIN IMMEDIATE")
         try:
+            self.fence()
             yield
             self.db.execute("UPDATE meta SET value=? WHERE key='cutoff_ms' AND CAST(value AS INTEGER)<?",
                             (str(self.clock.now_ms), self.clock.now_ms))
@@ -156,17 +170,24 @@ class ReplayStore:
         self.clock.check(found["available_ms"], f"result:{job_id}:{attempt}")
         return json.loads(found["raw_result"])
 
-    def coverage(self, source: str, from_ms: int, to_ms: int) -> list[tuple[int, int, str]]:
-        """Segments of [from_ms, to_ms] at their highest recorded level; uncovered parts are `unknown`."""
+    def coverage(self, source: str, from_ms: int, to_ms: int, *, tolerance_ms: int = 0) -> list[tuple[int, int, str]]:
+        """Segments of [from_ms, to_ms] at their highest recorded level; uncovered parts are `unknown`.
+        Rows of one level that are apart by at most `tolerance_ms` are read as one span (capture jitter)."""
         self.clock.check(to_ms, f"coverage:{source}")
-        covered = self.rows("""SELECT level, from_ms, to_ms FROM coverage WHERE source=? AND recorded_ms<=?
-                               AND to_ms>? AND from_ms<?""", (source, self.clock.now_ms, from_ms, to_ms))
-        points = sorted({from_ms, to_ms, *(max(from_ms, r["from_ms"]) for r in covered),
-                         *(min(to_ms, r["to_ms"]) for r in covered)})
+        rows = self.rows("""SELECT level, from_ms, to_ms FROM coverage WHERE source=? AND recorded_ms<=?
+                            AND to_ms>=? AND from_ms<=? ORDER BY level, from_ms, to_ms""",
+                         (source, self.clock.now_ms, from_ms - tolerance_ms, to_ms + tolerance_ms))
+        covered: list[tuple[str, int, int]] = []
+        for r in rows:
+            if covered and covered[-1][0] == r["level"] and r["from_ms"] <= covered[-1][2] + tolerance_ms:
+                covered[-1] = (r["level"], covered[-1][1], max(covered[-1][2], r["to_ms"]))
+            else:
+                covered.append((r["level"], r["from_ms"], r["to_ms"]))
+        covered = [c for c in covered if c[2] > from_ms and c[1] < to_ms]
+        points = sorted({from_ms, to_ms, *(max(from_ms, c[1]) for c in covered), *(min(to_ms, c[2]) for c in covered)})
         segments: list[tuple[int, int, str]] = []
         for start, end in zip(points, points[1:]):
-            level = max((r["level"] for r in covered if r["from_ms"] <= start and r["to_ms"] >= end),
-                        key=LEVEL_RANK.get, default="unknown")
+            level = max((c[0] for c in covered if c[1] <= start and c[2] >= end), key=LEVEL_RANK.get, default="unknown")
             if segments and segments[-1][2] == level:
                 segments[-1] = (segments[-1][0], end, level)
             else:

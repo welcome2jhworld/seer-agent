@@ -1,6 +1,7 @@
 """ReplayCore owns the state. Sources and workers return data; only this object validates and commits."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 from typing import Any
@@ -36,11 +37,12 @@ class Placement:
 
 class ReplayCore:
     """The single writer. Frames, signals, worker results and the clock come from outside; every
-    record in the store is written here, inside a transaction, after validation.
+    record in the store is written here, inside a fenced transaction, after validation.
 
-    Each owner of a store takes a higher `owner_epoch` (the execution owner fence). Results stored
-    under earlier epochs of the same store are its own prior work and are adopted; results under an
-    epoch the store never had are audited only."""
+    Each owner of a store takes a higher `owner_epoch` (the execution owner fence) and the store
+    refuses every later commit from an owner that is no longer the latest. Results committed under
+    earlier epochs of the same store were committed while that owner was current, so they are its
+    own prior work and are adopted; results under an epoch the store never had are audited only."""
 
     def __init__(self, store: ReplayStore, worker: Worker, *, owner_epoch: int | None = None,
                  pin_budget_bytes: int = 1 << 20, period_ms: int = 500, retention_ms: int = 10_000):
@@ -49,6 +51,8 @@ class ReplayCore:
         self.store, self.worker, self.clock = store, worker, store.clock
         self.pin_budget_bytes, self.period_ms, self.retention_ms = pin_budget_bytes, period_ms, retention_ms
         self.sources: dict[tuple[str, str], BoundedSource] = {}
+        self._ring_pins: list[tuple[tuple[str, str], int]] = []
+        self._ring_releases: list[tuple[tuple[str, str], int]] = []
         self._watches: dict[tuple[str, int], Watch] = {}
         self.watches: dict[str, Watch] = {}
         for row in store.rows("SELECT body FROM watches ORDER BY id, revision"):
@@ -56,7 +60,8 @@ class ReplayCore:
             self._watches[(watch.id, watch.revision)] = watch
             self.watches[watch.id] = watch
         self.owner_epoch = self._take_epoch(owner_epoch)
-        # One job at a time survives a restart: a stored result whose availability time has not passed still occupies the worker.
+        # One job at a time survives a restart: a stored result whose availability time has not passed still
+        # occupies the worker. This reads a future time value, but only as the worker's busy marker, never as evidence.
         self._busy_until_ms = store.row("SELECT COALESCE(MAX(available_ms),0) AS until FROM attempts WHERE status='stored' AND reduced=0")["until"]
         self._recover()
 
@@ -75,13 +80,32 @@ class ReplayCore:
     def advance(self, now_ms: int) -> int:
         return self.clock.advance(now_ms)
 
-    def _take_epoch(self, requested: int | None) -> int:
+    @contextmanager
+    def _commit(self):
+        """One durable, fenced commit. Ring pins and releases collected inside are applied only after the
+        commit succeeded, so a rolled-back transaction leaves the ring exactly as the store says."""
+        self._ring_pins, self._ring_releases = [], []
         with self.store.transaction():
+            yield
+        releases, pins = self._ring_releases, self._ring_pins
+        self._ring_pins, self._ring_releases = [], []
+        for key, sequence in releases:
+            source = self.sources.get(key)
+            if source is not None:
+                source.release(sequence)
+        for key, sequence in pins:
+            source = self.sources.get(key)
+            if source is not None:
+                source.pin(sequence)
+
+    def _take_epoch(self, requested: int | None) -> int:
+        with self._commit():
             last = self.store.row("SELECT COALESCE(MAX(epoch),0) AS epoch FROM owners")["epoch"]
             epoch = last + 1 if requested is None else requested
             if epoch <= last:
                 raise ContractError("owner_epoch_not_advanced")
             self.store.db.execute("INSERT INTO owners VALUES(?,?)", (epoch, self.now))
+        self.store.owner_epoch = epoch  # from here on every commit through this store is fenced on it
         return epoch
 
     def attach(self, source: BoundedSource) -> None:
@@ -114,7 +138,7 @@ class ReplayCore:
         if latest is not None and watch.revision < latest.revision:
             raise ContractError("watch_revision_regressed")
         if known is None:
-            with self.store.transaction():
+            with self._commit():
                 self.store.db.execute("INSERT INTO watches VALUES(?,?,?)", (watch.id, watch.revision, body))
         self._watches[(watch.id, watch.revision)] = watch
         self.watches[watch.id] = watch
@@ -124,7 +148,7 @@ class ReplayCore:
     def ingest(self, frame: Frame) -> str:
         """Commit one published frame: frame record, evidence handle and `captured` coverage."""
         self.clock.check(frame.published_ms, f"frame:{frame.handle}")
-        with self.store.transaction():
+        with self._commit():
             known = self.store.row("SELECT * FROM frames WHERE handle=?", (frame.handle,))
             if known is not None:
                 if any(known[k] != getattr(frame, k) for k in ("captured_ms", "published_ms", "size_bytes", "content")):
@@ -153,19 +177,25 @@ class ReplayCore:
         if to_ms < from_ms or published_ms < to_ms:
             raise ContractError("invalid_signal")
         self.clock.check(published_ms, f"signal:{source}:{kind}")
-        with self.store.transaction():
+        with self._commit():
             self._cover(source, "signal", from_ms, to_ms, digest(["signal", source, kind, from_ms, to_ms]))
+
+    def coverage(self, source: str, from_ms: int, to_ms: int) -> list[tuple[int, int, str]]:
+        """Coverage with the same capture-jitter tolerance the reducer uses when it joins frames into one look."""
+        return self.store.coverage(source, from_ms, to_ms, tolerance_ms=self.period_ms // 2)
 
     def _cover(self, source: str, level: str, from_ms: int, to_ms: int, ref: str) -> None:
         self.store.db.execute("INSERT OR IGNORE INTO coverage VALUES(?,?,?,?,?,?)",
                               (source, level, from_ms, to_ms, self.now, ref))
 
     def _segments(self, captured: list[int]) -> list[tuple[int, int]]:
-        """Each frame stands for [captured - period, captured]; spans merge only where they touch."""
+        """Each frame stands for [captured - period, captured]. Spans merge where they touch or are apart by
+        at most half a period (capture jitter); a larger gap splits the look and stays unknown."""
+        tolerance = self.period_ms // 2
         segments: list[tuple[int, int]] = []
         for instant in sorted(captured):
             start, end = max(0, instant - self.period_ms), instant
-            if segments and start <= segments[-1][1]:
+            if segments and start <= segments[-1][1] + tolerance:
                 segments[-1] = (segments[-1][0], max(segments[-1][1], end))
             else:
                 segments.append((start, end))
@@ -181,21 +211,15 @@ class ReplayCore:
         if to_ms < from_ms or priority not in PRIORITIES or deadline_ms < self.now:
             raise ContractError("invalid_request")
         self.clock.check(to_ms, f"request:{watch_id}")
-        with self.store.transaction():
-            response, pins = self._admit(watch, from_ms, to_ms, deadline_ms, kind, priority)
-        # Ring pins follow the durable commit; a rolled-back request leaves the ring untouched.
-        for key, sequence in pins:
-            source = self.sources.get(key)
-            if source is not None:
-                source.pin(sequence)
-        return response
+        with self._commit():
+            return self._admit(watch, from_ms, to_ms, deadline_ms, kind, priority)
 
-    def _admit(self, watch: Watch, from_ms: int, to_ms: int, deadline_ms: int, kind: str, priority: str) -> tuple[dict, list]:
+    def _admit(self, watch: Watch, from_ms: int, to_ms: int, deadline_ms: int, kind: str, priority: str) -> dict:
         now = self.now
         frames = self.store.frames(watch.source, from_ms, to_ms)
         if not frames:
             self._question(None, "not_observed", watch.source, from_ms, to_ms, {"watch": watch.id})
-            return {"status": "refused", "reason": "not_observed"}, []
+            return {"status": "refused", "reason": "not_observed"}
         evidence = [self.store.evidence(f["handle"]) for f in frames]
         lost = [e for e in evidence if e["pinned_by"] is None and e["available_until_ms"] < now]
         if lost:
@@ -204,26 +228,26 @@ class ReplayCore:
                                                      "handles": [e["handle"] for e in lost]})
         kept = [e for e in evidence if e["pinned_by"] is not None or e["available_until_ms"] >= now]
         if not kept:
-            return {"status": "refused", "reason": "evidence_lost_before_inspection"}, []
+            return {"status": "refused", "reason": "evidence_lost_before_inspection"}
         segments = self._segments([e["captured_ms"] for e in kept])
         if len(segments) > 1:
             # One look covers one interval. A gap between the frames stays unknown and is recorded as such.
             for (_, end), (start, _) in zip(segments, segments[1:]):
                 self._question(None, "not_observed", watch.source, end, start, {"watch": watch.id, "reason": "gap_inside_request"})
-            return {"status": "refused", "reason": "not_contiguous", "segments": [list(s) for s in segments]}, []
+            return {"status": "refused", "reason": "not_contiguous", "segments": [list(s) for s in segments]}
         handles = [e["handle"] for e in kept]
         logical_key = digest(["job", watch.id, watch.revision, kind, handles])
         open_job = self.store.row("""SELECT id FROM jobs WHERE logical_key=? AND (status IN ('pending','running','stored')
             OR EXISTS(SELECT 1 FROM attempts WHERE attempts.job_id=jobs.id AND attempts.status='valid'))""", (logical_key,))
         if open_job is not None:
-            return {"status": "known", "job_id": open_job["id"]}, []
+            return {"status": "known", "job_id": open_job["id"]}
         needed = sum(e["size_bytes"] for e in kept if e["pinned_by"] is None)
         pinned = self.store.row("SELECT COALESCE(SUM(size_bytes),0) AS total FROM evidence WHERE pinned_by IS NOT NULL")["total"]
         if pinned + needed > self.pin_budget_bytes:
             self._question(None, "evidence_lost_before_inspection", watch.source, from_ms, to_ms, {
                 "reason": "pin_budget_full", "watch": watch.id, "needed_bytes": needed,
                 "pinned_bytes": pinned, "budget_bytes": self.pin_budget_bytes})
-            return {"status": "refused", "reason": "pin_budget_full"}, []
+            return {"status": "refused", "reason": "pin_budget_full"}
         # A closed job (expired, failed, rejected) does not block the interval: the new job supersedes it.
         generation = self.store.row("SELECT COUNT(*) AS n FROM jobs WHERE logical_key=?", (logical_key,))["n"]
         job_id = digest(["job", logical_key, generation])
@@ -233,19 +257,19 @@ class ReplayCore:
         for e in kept:
             if e["pinned_by"] is None:
                 self.store.db.execute("UPDATE evidence SET pinned_by=? WHERE handle=?", (job_id, e["handle"]))
+            self._ring_pins.append(((e["source"], e["session"]), e["sequence"]))
         self.store.db.execute("INSERT INTO jobs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             job_id, logical_key, watch.id, watch.revision, watch.mission_version, self.context_version, self.owner_epoch,
             kind, PRIORITIES[priority], watch.source, kept[0]["session"], kept[0]["sequence"], kept[-1]["sequence"],
             from_ms, to_ms, manifest_ref, now, deadline_ms, "pending"))
-        pins = [((e["source"], e["session"]), e["sequence"]) for e in kept]
-        return {"status": "queued", "job_id": job_id, "handles": len(handles)}, pins
+        return {"status": "queued", "job_id": job_id, "handles": len(handles)}
 
     def run_pending(self) -> dict | None:
         """Run at most one job on the worker and store its raw result. Nothing is reduced here."""
         now = self.now
         if now < self._busy_until_ms:
             return None
-        with self.store.transaction():
+        with self._commit():
             job = self.store.row("SELECT * FROM jobs WHERE status='pending' ORDER BY priority, deadline_ms, created_ms LIMIT 1")
             if job is None:
                 return None
@@ -271,20 +295,26 @@ class ReplayCore:
         try:
             result = self.worker.infer(request)
         except Exception as error:
-            with self.store.transaction():
+            with self._commit():
                 self.store.db.execute("UPDATE attempts SET status='failed', reduce_outcome=? WHERE job_id=? AND attempt=?",
                                       (f"worker_failed:{type(error).__name__}", job["id"], attempt))
                 self._retry_or_close(job, attempt, "inference_failed")
             return {"job_id": job["id"], "attempt": attempt, "status": "failed"}
+        # Output that cannot be stored (NaN scores, non-JSON values) or is not an object is a rejected result,
+        # not a retry reason, and never reaches the reducer.
         try:
             latency_ms = max(0, int(result.latency_ms))
             raw = encoded(result.payload)
         except (TypeError, ValueError, OverflowError):
-            # Output that cannot be stored (NaN scores, non-JSON values) is a rejected result, not a retry reason.
-            with self.store.transaction():
-                self._finish_attempt(job, attempt, "rejected", "rejected:unserializable_result", None)
+            raw, code = None, "unserializable_result"
+        else:
+            code = None if isinstance(result.payload, dict) else "invalid_result"
+        if code is not None:
+            with self._commit():
+                self.store.db.execute("UPDATE attempts SET raw_result=? WHERE job_id=? AND attempt=?", (raw, job["id"], attempt))
+                self._finish_attempt(job, attempt, "rejected", f"rejected:{code}", None)
             return {"job_id": job["id"], "attempt": attempt, "status": "rejected"}
-        with self.store.transaction():
+        with self._commit():
             self.store.db.execute("""UPDATE attempts SET status='stored', available_ms=?, inference_ms=?, raw_result=?
                                      WHERE job_id=? AND attempt=?""", (now + latency_ms, latency_ms, raw, job["id"], attempt))
             self.store.db.execute("UPDATE jobs SET status='stored' WHERE id=?", (job["id"],))
@@ -315,6 +345,7 @@ class ReplayCore:
         self._trace(job, attempt, "", self.now - job["created_ms"], 0, f"{status}:{reason}", None)
 
     def _release(self, job_id: str) -> None:
+        """Unpin the job's evidence in the store; the ring follows after the commit (see `_commit`)."""
         job = self.store.row("SELECT manifest_ref FROM jobs WHERE id=?", (job_id,))
         handles = json.loads(self.store.row("SELECT handles FROM manifests WHERE ref=?", (job["manifest_ref"],))["handles"])
         still_needed: set[str] = set()
@@ -328,13 +359,11 @@ class ReplayCore:
             if evidence["pinned_by"] is None:
                 continue
             self.store.db.execute("UPDATE evidence SET pinned_by=NULL WHERE handle=?", (handle,))
-            source = self.sources.get((evidence["source"], evidence["session"]))
-            if source is not None:
-                source.release(evidence["sequence"])
+            self._ring_releases.append(((evidence["source"], evidence["session"]), evidence["sequence"]))
 
     def _recover(self) -> None:
         """Attempts left running by a previous owner have an unknown outcome; they are never assumed finished."""
-        with self.store.transaction():
+        with self._commit():
             for row in self.store.rows("SELECT * FROM attempts WHERE status='running'"):
                 self.store.db.execute("UPDATE attempts SET status='unknown', reduce_outcome='owner_restarted' WHERE job_id=? AND attempt=?",
                                       (row["job_id"], row["attempt"]))
@@ -348,16 +377,20 @@ class ReplayCore:
         rows = self.store.rows("""SELECT a.job_id, a.attempt FROM attempts a JOIN jobs j ON j.id=a.job_id
                                   WHERE a.status='stored' AND a.reduced=0 AND a.available_ms<=?
                                   ORDER BY a.available_ms, j.created_ms, a.attempt""", (self.now,))
-        return [self._reduce(r["job_id"], r["attempt"]) for r in rows]
+        traces = [self._reduce(r["job_id"], r["attempt"]) for r in rows]
+        return [trace for trace in traces if trace is not None]
 
     def tick(self) -> dict:
         pulled, ran, traces = self.pull(), self.run_pending(), self.reduce_pending()
         return {"now_ms": self.now, "frames": pulled, "ran": ran, "reduced": [t.outcome for t in traces]}
 
-    def _reduce(self, job_id: str, attempt_no: int) -> Trace:
-        with self.store.transaction():
-            job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
+    def _reduce(self, job_id: str, attempt_no: int) -> Trace | None:
+        with self._commit():
             attempt = self.store.row("SELECT * FROM attempts WHERE job_id=? AND attempt=?", (job_id, attempt_no))
+            if attempt is None or attempt["status"] != "stored" or attempt["reduced"]:
+                return None  # already reduced, by this owner or an earlier one: a no-op, never a rewrite
+            self.clock.check(attempt["available_ms"], f"result:{job_id}:{attempt_no}")
+            job = self.store.row("SELECT * FROM jobs WHERE id=?", (job_id,))
             watch = self._watch(job["watch_id"], job["watch_revision"])  # the contract the look was requested under
             latest = self.watches.get(job["watch_id"])
             payload = json.loads(attempt["raw_result"])
@@ -387,8 +420,10 @@ class ReplayCore:
         return self._trace(job, attempt_no, attempt["model_id"] or "", attempt["queue_ms"], attempt["inference_ms"] or 0,
                            outcome, estimate_id)
 
-    def _step1_validate(self, job, attempt, watch: Watch | None, latest: Watch | None, payload: dict) -> Verdict:
+    def _step1_validate(self, job, attempt, watch: Watch | None, latest: Watch | None, payload: Any) -> Verdict:
         """Step 1: provenance, availability cutoff, quality, job identity, owner epoch and watch revision."""
+        if not isinstance(payload, dict):
+            return Verdict(False, False, "invalid_result")
         if payload.get("job_id") != job["id"] or payload.get("attempt") != attempt["attempt"]:
             return Verdict(False, False, "job_identity_mismatch")
         if payload.get("model_id") != attempt["model_id"]:
@@ -423,7 +458,7 @@ class ReplayCore:
 
     def _step2_attach_interval(self, job) -> tuple[int, int]:
         """Step 2: the result belongs to the inspected frames' own capture spans, never to the time inference
-        finished. Spans merge only where they touch, so a look never covers a gap between its frames."""
+        finished. Spans merge only where they touch (within capture jitter), so a look never covers a gap."""
         handles = json.loads(self.store.row("SELECT handles FROM manifests WHERE ref=?", (job["manifest_ref"],))["handles"])
         segments = self._segments([self.store.evidence(h)["captured_ms"] for h in handles])
         for index, (start, end) in enumerate(segments):
@@ -459,15 +494,17 @@ class ReplayCore:
     def _step4_update_estimate(self, watch: Watch, situation, observation: dict, interval: tuple[int, int],
                                verdict: Verdict) -> Placement:
         """Step 4: the current estimate changes only for an applicable, fresh result; everything else is history.
-        A current estimate that has fallen out of the freshness window is demoted here, so nothing stale stays current."""
-        if observation["repeat_of"] is not None:
-            return Placement("repeat", None, "same_frames_already_observed")
-        if observation["picked"] in (UNKNOWN, INSUFFICIENT):
-            return Placement("none", None, f"undecided:{observation['picked']}")
+        A current estimate that has fallen out of the freshness window is demoted first, whatever the result says,
+        so nothing stale stays current through a repeat or an undecided look."""
         current = self.store.current_estimate(situation["merge_key"])
         if current is not None and self.now - current["to_ms"] > watch.freshness_ms:
-            self.store.db.execute("UPDATE estimates SET current=0, placement='history', reason='expired' WHERE id=?", (current["id"],))
+            self.store.db.execute("UPDATE estimates SET current=0, placement='history', reason='expired', demoted_ms=? WHERE id=?",
+                                  (self.now, current["id"]))
             current = None
+        if observation["repeat_of"] is not None:
+            return Placement("repeat", None, "same_frames_already_observed", current)
+        if observation["picked"] in (UNKNOWN, INSUFFICIENT):
+            return Placement("none", None, f"undecided:{observation['picked']}", current)
         if not verdict.applicable:
             reason = verdict.code
         elif current is not None and interval[1] < current["to_ms"]:
@@ -478,9 +515,9 @@ class ReplayCore:
             reason = None
         estimate_id = digest(["estimate", observation["id"]])
         if reason is None:
-            self.store.db.execute("UPDATE estimates SET current=0, placement='history', reason='superseded' WHERE situation_id=? AND current=1",
-                                  (situation["id"],))
-        self.store.db.execute("INSERT OR IGNORE INTO estimates VALUES(?,?,?,?,?,?,?,?,?,?)", (
+            self.store.db.execute("""UPDATE estimates SET current=0, placement='history', reason='superseded', demoted_ms=?
+                                     WHERE situation_id=? AND current=1""", (self.now, situation["id"]))
+        self.store.db.execute("INSERT OR IGNORE INTO estimates VALUES(?,?,?,?,?,?,?,?,?,?,NULL)", (
             estimate_id, situation["id"], observation["id"], observation["picked"], interval[0], interval[1], self.now,
             int(reason is None), "current" if reason is None else "history", reason or "fresh"))
         return Placement("current" if reason is None else "history", estimate_id, reason or "fresh", current)
