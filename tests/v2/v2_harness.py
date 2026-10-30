@@ -39,12 +39,12 @@ class Harness:
             self.core.advance(until_ms)
             self.core.tick()
 
-    def restart(self, now_ms: int) -> ReplayCore:
-        """Close the store and open a new owner on the same file, keeping the same fake worker."""
+    def restart(self, now_ms: int, *, owner_epoch: int | None = None) -> ReplayCore:
+        """Close the store and open a new owner on the same file, keeping the same fake worker and ring."""
         self.store.close()
         self.clock = CausalClock(now_ms)
         self.store = ReplayStore(self.path, self.clock)
-        self.core = ReplayCore(self.store, self.worker, pin_budget_bytes=self.budget, period_ms=self.period,
-                               retention_ms=self.retention)
+        self.core = ReplayCore(self.store, self.worker, owner_epoch=owner_epoch, pin_budget_bytes=self.budget,
+                               period_ms=self.period, retention_ms=self.retention)
         self.core.attach(self.source)
         return self.core

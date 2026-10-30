@@ -2,7 +2,7 @@
 import pytest
 
 from seer_agent import ContractError
-from seer_agent.v2 import FakeWorker
+from seer_agent.v2 import INSUFFICIENT, FakeWorker
 from v2_harness import LIQUID, SHADOW, WATCH, frame
 
 KEY = WATCH.merge_key
@@ -98,7 +98,8 @@ def test_restart_marks_a_running_attempt_unknown_and_retries_once_within_deadlin
 
 
 def test_backlog_late_result_for_older_interval_becomes_history(harness):
-    h = harness(FakeWorker({(0, 4000): (3000, SHADOW), (9000, 12_000): (500, LIQUID)}), retention=20_000)
+    close_pair = {"liquid": 0.5, "shadow": 0.65, INSUFFICIENT: 0.05}  # within the margin: would open a check if current
+    h = harness(FakeWorker({(0, 4000): (3000, close_pair), (9000, 12_000): (500, LIQUID)}), retention=20_000)
     h.offer(*[frame(s) for s in (*range(1, 9), *range(19, 25))])
     h.run_until(12_000)
     older = h.core.request("leak-a", 0, 4000, deadline_ms=40_000, priority="discriminating_check")

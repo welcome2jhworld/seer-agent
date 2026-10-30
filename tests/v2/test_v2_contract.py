@@ -78,23 +78,31 @@ def test_evidence_lost_to_retention_is_recorded_and_the_rest_is_inspected(harnes
     assert h.store.coverage("cam-a", 0, 4000) == [(0, 1500, "captured"), (1500, 4000, "inspected")]
 
 
-def test_stale_watch_revision_is_history_and_invalid_results_are_rejected(harness):
-    h = harness(FakeWorker({(0, 2000): (100, LIQUID), (2500, 4000): (100, {"liquid": "high"})}))
+def test_stale_watch_revision_is_decided_under_its_own_revision_and_invalid_results_are_rejected(harness):
+    borderline = {"liquid": 0.65, "shadow": 0.3, INSUFFICIENT: 0.05}  # clears threshold 0.6, not 0.7
+    h = harness(FakeWorker({(0, 2000): (100, borderline), (2500, 4000): (100, borderline),
+                            (0, 1000): (100, {"liquid": "high"})}))
     h.offer(*[frame(s) for s in range(1, 9)])
     h.run_until(4000)
     h.core.request("leak-a", 0, 2000, deadline_ms=30_000)
     h.core.run_pending()
     h.core.register_watch(replace(WATCH, revision=2, threshold=0.7))  # the allowed checks changed before reduction
     h.run_until(4500)
+    # Decided with the threshold it was requested under (0.6 picks liquid), then filed as history under revision 2.
     assert [t.outcome for t in h.store.traces()] == ["history:stale_watch_revision:liquid"]
     assert h.store.current_estimate(KEY) is None and h.store.history(KEY)[0]["reason"] == "stale_watch_revision"
-    bad = h.core.request("leak-a", 2500, 4000, deadline_ms=30_000)
+    # A look requested under revision 2 is decided with 0.7, so the same scores are undecided.
+    assert h.core.request("leak-a", 2500, 4000, deadline_ms=30_000)["status"] == "queued"
     h.run_until(5000)
+    assert (h.store.traces()[-1].outcome, h.store.traces()[-1].watch_revision) == ("undecided:unknown", 2)
+    assert [(q["from_ms"], q["to_ms"]) for q in h.store.questions("not_decidable")] == [(2000, 4000)]
+    bad = h.core.request("leak-a", 0, 1000, deadline_ms=30_000)
+    h.run_until(5500)
     assert h.store.traces()[-1].outcome == "rejected:invalid_result"
-    assert [a["status"] for a in h.store.rows("SELECT status FROM attempts ORDER BY started_ms")] == ["valid", "rejected"]
-    assert len(h.store.observations(KEY)) == 1  # a rejected result is not evidence
+    assert [a["status"] for a in h.store.rows("SELECT status FROM attempts ORDER BY started_ms")] == ["valid", "valid", "rejected"]
+    assert len(h.store.observations(KEY)) == 2  # a rejected result is not evidence
     assert h.store.row("SELECT status FROM jobs WHERE id=?", (bad["job_id"],))["status"] == "reduced"  # not retried
-    assert h.worker.calls == 2
+    assert h.worker.calls == 3
     with pytest.raises(ContractError, match="watch_revision_regressed"):
         h.core.register_watch(WATCH)
 

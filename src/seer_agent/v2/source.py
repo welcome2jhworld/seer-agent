@@ -31,6 +31,15 @@ class BoundedSource:
         self._pinned: set[int] = set()
         self.duplicates = 0
         self.evictions = 0
+        self.dropped = 0
+
+    @property
+    def pinned(self) -> frozenset[int]:
+        return frozenset(self._pinned)
+
+    def sync_pins(self, sequences: set[int]) -> None:
+        """Make the ring's pins match the store's record of held evidence."""
+        self._pinned = {s for s in sequences if s in self._frames}
 
     def __len__(self) -> int:
         return len(self._frames)
@@ -44,15 +53,17 @@ class BoundedSource:
                 raise ContractError("frame_identity_conflict")
             self.duplicates += 1
             return "duplicate"
-        self._frames[frame.sequence] = frame
-        while len(self._frames) > self.capacity:
+        if len(self._frames) >= self.capacity:
+            # The ring is full: the oldest unpinned frame leaves, and that may be the frame just offered.
             unpinned = [s for s in self._frames if s not in self._pinned]
-            if not unpinned:
-                raise ContractError("ring_full_of_pinned_frames")
-            oldest = min(unpinned, key=lambda s: (self._frames[s].published_ms, s))
+            oldest = min(unpinned, key=lambda s: (self._frames[s].published_ms, s), default=None)
+            if oldest is None or (self._frames[oldest].published_ms, oldest) > (frame.published_ms, frame.sequence):
+                self.dropped += 1
+                return "dropped"
             del self._frames[oldest]
             self._delivered.discard(oldest)
             self.evictions += 1
+        self._frames[frame.sequence] = frame
         return "accepted"
 
     def readable(self, clock: CausalClock) -> list[Frame]:

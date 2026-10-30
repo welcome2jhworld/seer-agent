@@ -7,12 +7,14 @@ import sqlite3
 from pathlib import Path
 
 from ..contracts import ContractError
-from .clock import CausalClock
+from .clock import CausalClock, CausalViolation
 from .records import Trace
 
 SCHEMA = """
     CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS watches(id TEXT PRIMARY KEY, revision INTEGER NOT NULL, body TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS owners(epoch INTEGER PRIMARY KEY, opened_ms INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS watches(
+        id TEXT NOT NULL, revision INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(id, revision));
     CREATE TABLE IF NOT EXISTS frames(
         handle TEXT PRIMARY KEY, source TEXT NOT NULL, session TEXT NOT NULL, sequence INTEGER NOT NULL,
         captured_ms INTEGER NOT NULL, published_ms INTEGER NOT NULL, size_bytes INTEGER NOT NULL,
@@ -28,13 +30,14 @@ SCHEMA = """
     CREATE TABLE IF NOT EXISTS manifests(
         ref TEXT PRIMARY KEY, handles TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS jobs(
-        id TEXT PRIMARY KEY, watch_id TEXT NOT NULL, watch_revision INTEGER NOT NULL,
+        id TEXT PRIMARY KEY, logical_key TEXT NOT NULL, watch_id TEXT NOT NULL, watch_revision INTEGER NOT NULL,
         mission_version INTEGER NOT NULL, context_version INTEGER NOT NULL, owner_epoch INTEGER NOT NULL,
         kind TEXT NOT NULL, priority INTEGER NOT NULL, source TEXT NOT NULL, session TEXT NOT NULL,
         sequence_from INTEGER NOT NULL, sequence_to INTEGER NOT NULL, from_ms INTEGER NOT NULL,
         to_ms INTEGER NOT NULL, manifest_ref TEXT NOT NULL, created_ms INTEGER NOT NULL,
         deadline_ms INTEGER NOT NULL, status TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS job_queue ON jobs(status, priority, deadline_ms, created_ms);
+    CREATE INDEX IF NOT EXISTS job_logical ON jobs(logical_key);
     CREATE TABLE IF NOT EXISTS attempts(
         job_id TEXT NOT NULL, attempt INTEGER NOT NULL, owner_epoch INTEGER NOT NULL, status TEXT NOT NULL,
         started_ms INTEGER NOT NULL, queue_ms INTEGER NOT NULL, available_ms INTEGER, inference_ms INTEGER,
@@ -45,11 +48,11 @@ SCHEMA = """
         id TEXT PRIMARY KEY, merge_key TEXT NOT NULL UNIQUE, source TEXT NOT NULL, region TEXT NOT NULL,
         predicate TEXT NOT NULL, from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL, coverage_level TEXT NOT NULL,
         mission_version INTEGER NOT NULL, context_version INTEGER NOT NULL, revision INTEGER NOT NULL,
-        revision_reason TEXT NOT NULL);
+        revision_reason TEXT NOT NULL, updated_ms INTEGER NOT NULL);
     CREATE TABLE IF NOT EXISTS alternatives(
         situation_id TEXT NOT NULL, hypothesis_id TEXT NOT NULL, supporting TEXT NOT NULL,
         contradicting TEXT NOT NULL, score_kind TEXT NOT NULL, score REAL, last_verified_ms INTEGER,
-        shared_error_group TEXT NOT NULL, PRIMARY KEY(situation_id, hypothesis_id));
+        shared_error_group TEXT NOT NULL, updated_ms INTEGER NOT NULL, PRIMARY KEY(situation_id, hypothesis_id));
     CREATE TABLE IF NOT EXISTS observations(
         id TEXT PRIMARY KEY, situation_id TEXT NOT NULL, job_id TEXT NOT NULL, attempt INTEGER NOT NULL,
         frames_digest TEXT NOT NULL, from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL, picked TEXT NOT NULL,
@@ -81,7 +84,11 @@ LEVEL_RANK = {"inspected": 3, "signal": 2, "captured": 1, "unknown": 0}
 
 
 class ReplayStore:
-    """Durable records plus guarded readers. Writers live in ReplayCore."""
+    """Durable records plus guarded readers. Writers live in ReplayCore.
+
+    The last committed cutoff is persisted in `meta`; a store cannot be opened with a clock behind
+    it, so a successor never reads commits from its own future. Read models filter by committed time
+    as a second guard."""
 
     def __init__(self, path: str | Path, clock: CausalClock):
         self.clock = clock
@@ -89,17 +96,23 @@ class ReplayStore:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] not in {0, 1}:
+        if self.db.execute("PRAGMA user_version").fetchone()[0] not in {0, 2}:
             raise ContractError("unsupported_store_version")
         self.db.executescript(SCHEMA)
         self.db.execute("INSERT OR IGNORE INTO meta VALUES('context_version','0')")
-        self.db.execute("PRAGMA user_version=1")
+        self.db.execute("INSERT OR IGNORE INTO meta VALUES('cutoff_ms','0')")
+        self.db.execute("PRAGMA user_version=2")
+        committed = int(self.meta("cutoff_ms", "0"))
+        if clock.now_ms < committed:
+            raise CausalViolation(f"clock_behind_committed_cutoff:{clock.now_ms}<{committed}")
 
     @contextmanager
     def transaction(self):
         self.db.execute("BEGIN IMMEDIATE")
         try:
             yield
+            self.db.execute("UPDATE meta SET value=? WHERE key='cutoff_ms' AND CAST(value AS INTEGER)<?",
+                            (str(self.clock.now_ms), self.clock.now_ms))
             self.db.execute("COMMIT")
         except BaseException:
             self.db.execute("ROLLBACK")
@@ -166,32 +179,35 @@ class ReplayStore:
         return self.rows("""SELECT * FROM search_index WHERE source=? AND predicate=? AND to_ms<=? AND indexed_ms<=?
                             ORDER BY entry""", (source, predicate, until_ms, self.clock.now_ms))
 
-    # Read models over committed state.
+    # Read models over committed state, limited to what was committed at or before the cutoff.
 
     def current_estimate(self, merge_key: str) -> sqlite3.Row | None:
         return self.row("""SELECT e.* FROM estimates e JOIN situations s ON s.id=e.situation_id
-                           WHERE s.merge_key=? AND e.current=1""", (merge_key,))
+                           WHERE s.merge_key=? AND e.current=1 AND e.committed_ms<=?""", (merge_key, self.clock.now_ms))
 
     def history(self, merge_key: str) -> list[sqlite3.Row]:
         return self.rows("""SELECT e.* FROM estimates e JOIN situations s ON s.id=e.situation_id
-                            WHERE s.merge_key=? AND e.current=0 ORDER BY e.committed_ms, e.id""", (merge_key,))
+                            WHERE s.merge_key=? AND e.current=0 AND e.committed_ms<=? ORDER BY e.committed_ms, e.id""",
+                         (merge_key, self.clock.now_ms))
 
     def observations(self, merge_key: str) -> list[sqlite3.Row]:
         return self.rows("""SELECT o.* FROM observations o JOIN situations s ON s.id=o.situation_id
-                            WHERE s.merge_key=? ORDER BY o.observed_ms, o.id""", (merge_key,))
+                            WHERE s.merge_key=? AND o.observed_ms<=? ORDER BY o.observed_ms, o.id""",
+                         (merge_key, self.clock.now_ms))
 
     def alternatives(self, merge_key: str) -> dict[str, dict]:
         found = self.rows("""SELECT a.* FROM alternatives a JOIN situations s ON s.id=a.situation_id
-                             WHERE s.merge_key=? ORDER BY a.hypothesis_id""", (merge_key,))
+                             WHERE s.merge_key=? AND a.updated_ms<=? ORDER BY a.hypothesis_id""", (merge_key, self.clock.now_ms))
         return {r["hypothesis_id"]: {**dict(r), "supporting": json.loads(r["supporting"]),
                                      "contradicting": json.loads(r["contradicting"])} for r in found}
 
     def questions(self, kind: str | None = None) -> list[dict]:
-        found = self.rows("SELECT * FROM questions WHERE (?1 IS NULL OR kind=?1) ORDER BY created_ms, id", (kind,))
+        found = self.rows("SELECT * FROM questions WHERE (?1 IS NULL OR kind=?1) AND created_ms<=?2 ORDER BY created_ms, id",
+                          (kind, self.clock.now_ms))
         return [{**dict(r), "detail": json.loads(r["detail"])} for r in found]
 
     def checks(self) -> list[dict]:
-        found = self.rows("SELECT * FROM checks ORDER BY created_ms, id")
+        found = self.rows("SELECT * FROM checks WHERE created_ms<=? ORDER BY created_ms, id", (self.clock.now_ms,))
         return [{**dict(r), "separates": json.loads(r["separates"])} for r in found]
 
     def traces(self) -> list[Trace]:
