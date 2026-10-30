@@ -66,3 +66,5 @@ python -m build
 ```
 
 Tests cover synthetic workflows, scoped context, interrupted execution, idempotency, ordering, unknown outcomes, custom extensions and provider request formats with fake transports. No real model, camera, notification or telephone service is exercised. Source publication, hosted deployment and binary distribution are separate operations.
+
+The v2 causal replay core (branch `v2-core`, package `seer_agent.v2`) is described in [docs/v2.md](docs/v2.md).
