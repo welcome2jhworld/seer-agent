@@ -99,6 +99,8 @@ class ReplayCore:
                 source.pin(sequence)
 
     def _take_epoch(self, requested: int | None) -> int:
+        if self.store.owner_epoch is not None:
+            raise ContractError("store_already_owned")  # one core per store object; a successor opens its own store
         with self._commit():
             last = self.store.row("SELECT COALESCE(MAX(epoch),0) AS epoch FROM owners")["epoch"]
             epoch = last + 1 if requested is None else requested

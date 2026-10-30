@@ -90,7 +90,9 @@ class ReplayStore:
     The last committed cutoff is persisted in `meta`; a store cannot be opened with a clock behind
     it, so a successor never reads commits from its own future. Read models filter by committed time
     as a second guard. Every transaction is fenced: it commits only at or after the committed cutoff
-    and only for the store's latest owner epoch, so a superseded owner can no longer write."""
+    and, once a ReplayCore has taken its epoch on this store, only for the store's latest owner epoch,
+    so a superseded owner can no longer write. A bare ReplayStore without a core is fenced on the
+    cutoff only."""
 
     def __init__(self, path: str | Path, clock: CausalClock):
         self.clock = clock
@@ -99,12 +101,14 @@ class ReplayStore:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
-        if self.db.execute("PRAGMA user_version").fetchone()[0] not in {0, 2}:
+        # Schema version 3 (estimates.demoted_ms). Older files are refused rather than migrated: no store
+        # of this package has been released, and a silent mismatch would fail at the first placement instead.
+        if self.db.execute("PRAGMA user_version").fetchone()[0] not in {0, 3}:
             raise ContractError("unsupported_store_version")
         self.db.executescript(SCHEMA)
         self.db.execute("INSERT OR IGNORE INTO meta VALUES('context_version','0')")
         self.db.execute("INSERT OR IGNORE INTO meta VALUES('cutoff_ms','0')")
-        self.db.execute("PRAGMA user_version=2")
+        self.db.execute("PRAGMA user_version=3")
         committed = int(self.meta("cutoff_ms", "0"))
         if clock.now_ms < committed:
             raise CausalViolation(f"clock_behind_committed_cutoff:{clock.now_ms}<{committed}")

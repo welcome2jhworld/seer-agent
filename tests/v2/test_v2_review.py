@@ -1,4 +1,6 @@
 """Regressions for the v2-core review findings: one test per fix (H1, M1 to M5, L2 to L5; L1 is in the backlog test)."""
+import sqlite3
+
 import pytest
 
 from seer_agent import ContractError
@@ -53,9 +55,13 @@ def test_restart_with_a_raised_epoch_adopts_stored_results_and_audits_unknown_ep
     assert core.owner_epoch == 3 and core.known_epochs == {1, 3}
     traces = core.reduce_pending()
     assert [t.outcome for t in traces] == ["current:liquid"] and traces[0].owner_epoch == 1 and h.worker.calls == 1
+    with pytest.raises(ContractError, match="store_already_owned"):  # one core per store object
+        ReplayCore(h.store, h.worker)
     for epoch in (3, 2):  # reusing or lowering the epoch is refused
+        other = ReplayStore(h.path, CausalClock(core.now))
         with pytest.raises(ContractError, match="owner_epoch_not_advanced"):
-            ReplayCore(h.store, h.worker, owner_epoch=epoch)
+            ReplayCore(other, h.worker, owner_epoch=epoch)
+        other.close()
     # A result stored under an epoch this store never had is audited only: no observation, no estimate.
     job = core.request("leak-a", 2500, 4000, deadline_ms=30_000)["job_id"]
     core.run_pending()
@@ -289,3 +295,20 @@ def test_ring_pins_survive_a_rolled_back_release(harness, monkeypatch):  # F5
     monkeypatch.undo()
     assert [t.outcome for t in h.core.reduce_pending()] == ["current:liquid"]
     assert h.source.pinned == frozenset() and h.store.rows("SELECT handle FROM evidence WHERE pinned_by IS NOT NULL") == []
+
+
+def test_store_file_with_an_older_schema_is_refused(tmp_path):  # schema version 3
+    old = sqlite3.connect(tmp_path / "old.sqlite")
+    old.executescript("""
+        CREATE TABLE estimates(
+            id TEXT PRIMARY KEY, situation_id TEXT NOT NULL, observation_id TEXT NOT NULL,
+            hypothesis_id TEXT NOT NULL, from_ms INTEGER NOT NULL, to_ms INTEGER NOT NULL,
+            committed_ms INTEGER NOT NULL, current INTEGER NOT NULL, placement TEXT NOT NULL, reason TEXT NOT NULL);
+        PRAGMA user_version=2;""")
+    old.close()
+    with pytest.raises(ContractError, match="unsupported_store_version"):
+        ReplayStore(tmp_path / "old.sqlite", CausalClock(0))
+    fresh = ReplayStore(tmp_path / "new.sqlite", CausalClock(0))
+    assert fresh.row("PRAGMA user_version")[0] == 3
+    assert "demoted_ms" in {column[1] for column in fresh.rows("PRAGMA table_info(estimates)")}
+    fresh.close()
